@@ -62,7 +62,7 @@ std::string data_rate, link_delay, topology_file, flow_file, trace_file;
 std::string trace_output_file = "mix.tr";
 std::string fct_output_file = "fct.txt";
 std::string pfc_output_file = "pfc.txt";
-std::string send_output_file = ""; // default no send output
+std::string send_output_file = "send.txt"; // default no send output
 
 double error_rate_per_link = 0.0;
 uint32_t has_win = 1;
@@ -1014,7 +1014,7 @@ void SetupNetwork(
 
 #if ENABLE_QP
   FILE* fct_output = fopen(fct_output_file.c_str(), "w");
-  FILE* send_output = send_output_file.empty() ? nullptr : fopen(send_output_file.c_str(), "w");
+  FILE* send_output = fopen(send_output_file.c_str(), "w");
   std::cout << "QP is enabled " << std::endl;
   //
   // install RDMA driver
