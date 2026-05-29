@@ -10,15 +10,32 @@
 #include <functional>
 #include <mutex>
 #include <iostream>
+#include <cstdint>
 #include "common.h"
 
 // Forward-declare mnCCL SubmitAllReduce to avoid circular include with
 // `mnCCL.h` (which itself includes this header). Only the symbol is needed
 // here, so a forward declaration prevents the 'mnccl' not declared error.
 namespace mnccl {
+enum class CollectiveOp : uint8_t {
+  AllReduce = 0,
+  Broadcast,
+  Reduce,
+  Gather,
+  Scatter,
+  AllGather,
+  ReduceScatter
+};
 inline uint16_t SubmitAllReduce(uint32_t jobId,
+                                uint16_t pg,
                                 const std::vector<std::pair<uint32_t,uint32_t>>& gpus,
                                 uint64_t msgSize);
+inline uint16_t SubmitCollective(uint32_t jobId,
+                                 CollectiveOp op,
+                                 uint16_t pg,
+                                 const std::vector<std::pair<uint32_t,uint32_t>>& gpus,
+                                 uint64_t msgSize,
+                                 uint32_t root);
 }
 
 namespace cclScheduler {
@@ -36,8 +53,11 @@ static std::mutex s_pending_mutex;
 // FIFO order.
 struct PendingTask {
   uint32_t jobId;
+  mnccl::CollectiveOp op;
+  uint16_t pg;
   uint32_t need;    // number of GPUs required
   uint64_t msgSize; // optional payload size
+  uint32_t root;
 };
 
 static std::deque<PendingTask> s_pending_queue;
@@ -46,17 +66,36 @@ static std::vector<std::vector<bool>> s_busy; // [node][gpu]
 // Forward declarations for functions used before their full definitions.
 inline void ScheduleTask();
 inline PendingTask SchedulePendingTasks();
+using AllocationPolicy =
+    std::function<std::vector<std::pair<uint32_t, uint32_t>>(
+        uint32_t,
+        std::vector<std::vector<bool>>&,
+        uint32_t,
+        uint32_t)>;
+inline std::vector<std::pair<uint32_t, uint32_t>> FillAllocateGPUs(
+    uint32_t ngpus,
+    std::vector<std::vector<bool>>& busy,
+    uint32_t num_nodes,
+    uint32_t gpus_per_server);
 inline std::vector<std::pair<uint32_t, uint32_t>> AllocateGPUs(uint32_t ngpus);
+inline void SetAllocationPolicy(AllocationPolicy policy);
 inline void ReleaseGPUs(const std::vector<std::pair<uint32_t, uint32_t>>& gpus);
 inline int HasFreeGPUs(uint32_t need);
 inline void DequeuePendingTask();
 
+static AllocationPolicy s_allocate_policy = FillAllocateGPUs;
+
 // Enqueue a pending task (external code should call this when allocation
 // fails and it wants the scheduler to retry later).
-inline void EnqueuePendingTask(uint32_t jobId, uint32_t need, uint64_t msgSize) {
+inline void EnqueuePendingTask(uint32_t jobId,
+                               mnccl::CollectiveOp op,
+                               uint16_t pg,
+                               uint32_t need,
+                               uint64_t msgSize,
+                               uint32_t root = 0) {
   {
     std::lock_guard<std::mutex> lk(s_pending_mutex);
-    s_pending_queue.push_back(PendingTask{jobId, need, msgSize});
+    s_pending_queue.push_back(PendingTask{jobId, op, pg, need, msgSize, root});
   }
   // std::cout << "Scheduler: enqueued pending job " << jobId << " needing " << need
   //           << " GPUs at " << Simulator::Now().GetNanoSeconds() << "ns\n";
@@ -83,9 +122,15 @@ inline void ScheduleTask(){
     if (free_gpus==0) {
       // remove from pending queue under lock
       auto allocated = AllocateGPUs(task.need);
+      if (allocated.size() != task.need) {
+        ReleaseGPUs(allocated);
+        std::cout << "Scheduler: allocation policy returned " << allocated.size()
+                  << " GPUs for job " << task.jobId << ", need " << task.need << "\n";
+        return;
+      }
       DequeuePendingTask();
       // submit the job (mnCCL handles further synchronization)
-      mnccl::SubmitAllReduce(task.jobId, allocated, task.msgSize);
+      mnccl::SubmitCollective(task.jobId, task.op, task.pg, allocated, task.msgSize, task.root);
       std::cout << "Scheduler: scheduled pending job " << task.jobId
                 << " with allocated GPUs: "<< allocated.size() << "\n";
     }
@@ -112,7 +157,7 @@ inline PendingTask SchedulePendingTasks() {
   {
     std::lock_guard<std::mutex> lk(s_pending_mutex);
     if (s_pending_queue.empty())
-      return PendingTask{0,0,0};
+      return PendingTask{0, mnccl::CollectiveOp{}, 0, 0, 0, 0};
     task = s_pending_queue.front();
   }
   return task;
@@ -141,22 +186,35 @@ inline int HasFreeGPUs(uint32_t need) {
       }
     }
   }
-  return free_count;
+  return need - free_count;
 }
 
-// Allocate up to `ngpus` free GPUs. Returns vector of <node, gpu_idx>.
-inline std::vector<std::pair<uint32_t, uint32_t>> AllocateGPUs(uint32_t ngpus) {
+inline std::vector<std::pair<uint32_t, uint32_t>> FillAllocateGPUs(
+    uint32_t ngpus,
+    std::vector<std::vector<bool>>& busy,
+    uint32_t num_nodes,
+    uint32_t gpus_per_server) {
   std::vector<std::pair<uint32_t, uint32_t>> res;
-  std::lock_guard<std::mutex> lk(s_mutex);
-  for (uint32_t node = 0; node < s_num_nodes && res.size() < ngpus; node++) {
-    for (uint32_t g = 0; g < s_gpus_per_server && res.size() < ngpus; g++) {
-      if (!s_busy[node][g]) {
-        s_busy[node][g] = true;
+  for (uint32_t node = 0; node < num_nodes && res.size() < ngpus; node++) {
+    for (uint32_t g = 0; g < gpus_per_server && res.size() < ngpus; g++) {
+      if (!busy[node][g]) {
+        busy[node][g] = true;
         res.emplace_back(node, g);
       }
     }
   }
   return res;
+}
+
+inline void SetAllocationPolicy(AllocationPolicy policy) {
+  std::lock_guard<std::mutex> lk(s_mutex);
+  s_allocate_policy = policy ? policy : FillAllocateGPUs;
+}
+
+// Allocate GPUs through the configured allocation policy. Returns vector of <node, gpu_idx>.
+inline std::vector<std::pair<uint32_t, uint32_t>> AllocateGPUs(uint32_t ngpus) {
+  std::lock_guard<std::mutex> lk(s_mutex);
+  return s_allocate_policy(ngpus, s_busy, s_num_nodes, s_gpus_per_server);
 }
 
 // Release GPUs (mark them free again).

@@ -107,8 +107,7 @@ void qp_finish_normal(FILE* fout, Ptr<RdmaQueuePair> q) {
   #ifdef NS3_MTP
   cs.ExitSection();
   #endif
-  {  
-    cclScheduler::OnSendFinish(fout, q);
+  {
     mnccl::OnMessageFinish(fout, q);
     cclScheduler::ScheduleTask();
   }
