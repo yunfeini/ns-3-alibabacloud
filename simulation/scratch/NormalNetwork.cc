@@ -10,6 +10,7 @@
 #include "common.h"
 #include "mnCCL.h"
 #include "cclscheduler.h"
+#include <random>
 #include "ns3/applications-module.h"
 #include "ns3/core-module.h"
 #include "ns3/csma-module.h"
@@ -176,8 +177,39 @@ int main(int argc, char* argv[]) {
 
   // initialize mnCCL and scheduler (use values read by SetupNetwork)
   uint32_t gpu_num = node_num - switch_num - nvswitch_num;
+  // initialize scheduler: assume 1 GPU per server by default
   cclScheduler::Init(gpu_num, 1);
   mnccl::Init();
+  // specify file to write JID->QP mappings (one line per QP: jobId,srcNode,dstNode,sport)
+  // use a single detailed log file for all mnCCL / scheduler output
+  const std::string mncc_log = "mncc.log";
+  mnccl::SetJidQpLogPath(mncc_log);
+  ccl::SetCclLogPath(mncc_log);
+  // truncate previous logs so every run starts fresh
+  {
+    std::ofstream ofs(mncc_log, std::ofstream::trunc);
+  }
+
+  // Generate a task list of 10 AllToAll jobs. Each job requests `need` GPUs
+  // sampled uniformly from [16,64]. Expert-parallelism `ep` is fixed to 16.
+  {
+    std::mt19937 rng(12345);
+    std::uniform_int_distribution<int> dist_need(0,2);
+    uint32_t num_tasks = 20;
+    uint32_t ep = 16;
+    uint32_t kflows = 2;
+    uint64_t expert_mem_bytes = 64ULL * 1024ULL * 1024ULL; // 64MB per expert
+    double base_time = 0.001; // seconds spacing between submissions
+
+    for (uint32_t t = 0; t < num_tasks; ++t) {
+      uint32_t need = ep*pow(2,static_cast<uint32_t>(dist_need(rng)));
+      uint32_t jobId = mnccl::JID++;
+      double submit_time = base_time * (t + 1);
+      mnccl::CollectiveJob job{jobId, mnccl::CollectiveOp::AllToAll, mnccl::default_pg, need, submit_time, mnccl::msgSize, 0, kflows, ep, expert_mem_bytes};
+      mnccl::SubmitColJob(job);
+      std::cout << "NormalNetwork: scheduled job " << jobId << " need=" << need << " ep=" << ep << " at " << submit_time << "s\n";
+    }
+  }
 
   Simulator::Stop(Seconds(1)); // ensure all events are processed before Destroy
   printf("Simulation Start.\n");

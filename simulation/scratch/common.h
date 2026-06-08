@@ -72,6 +72,7 @@ uint32_t int_multi = 1;
 uint32_t ack_high_prio = 0;
 vector<uint64_t> link_down; // link down time, link down A, link down B
 uint32_t enable_trace = 1;
+uint32_t mon_enable = 0; // whether to enable monitor
 uint32_t buffer_size = 16; // MB
 
 uint32_t qp_mon_interval = 100; // us, qp_cnp_interval and qp_rate_interval
@@ -124,6 +125,8 @@ void InitConfigMap() {
       std::make_unique<ConfigVar<uint32_t>>(enable_trace);
   config_map["BUFFER_SIZE"] =
       std::make_unique<ConfigVar<uint32_t>>(buffer_size);
+  config_map["MON_ENABLE"] =
+      std::make_unique<ConfigVar<uint32_t>>(mon_enable);
   config_map["QP_MON_INTERVAL"] =
       std::make_unique<ConfigVar<uint32_t>>(qp_mon_interval);
   config_map["BW_MON_INTERVAL"] =
@@ -1166,7 +1169,9 @@ void SetupNetwork(
   // Simulator::Schedule(NanoSeconds(qlen_mon_start), &monitor_buffer, qlen_output,
   //                     &n);
   // schedule monitor
-	schedule_monitor();
+  if (mon_enable) {
+    schedule_monitor();
+  }
   std::cout << "network config done! " << std::endl;
 }
 #endif

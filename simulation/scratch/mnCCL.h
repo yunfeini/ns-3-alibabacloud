@@ -6,8 +6,12 @@
 #include <map>
 #include <vector>
 #include <mutex>
+#include <random>
 #include <iostream>
+#include <fstream>
 #include <cstdint>
+#include <string>
+#include "ccl_log.h"
 #include "common.h"
 #include "cclscheduler.h"
 
@@ -21,8 +25,14 @@ static std::map<uint16_t, std::vector<std::pair<uint32_t,uint32_t>>> g_alloc;
 // Map encoded key (pg<<48|src<<32|dst<<16|port) -> JID
 static std::map<uint64_t, uint16_t> g_key2JID;
 
+// Map JID -> associated RdmaQueuePairs (one-to-many). Stored here for
+// logging/inspection. Protected by g_mutex.
+static std::map<uint32_t, std::vector<Ptr<RdmaQueuePair>>> g_JID2QPs;
+
 // Mutex protecting the above maps
 static std::mutex g_mutex;
+// Path to write JID->QP mappings. Set by NormalNetwork via SetJidQpLogPath().
+static std::string g_jid_qp_log_path;
 
 struct CollectiveJob {
   uint32_t jobId;
@@ -32,6 +42,9 @@ struct CollectiveJob {
   double submitTime;
   uint64_t msgSize;
   uint32_t root;
+  uint32_t k;
+  uint32_t ep;
+  uint64_t expert_mem_bytes;
 };
 
 //forward declaration
@@ -44,8 +57,15 @@ inline uint16_t SubmitGather(uint32_t jobId, uint16_t pg, const std::vector<std:
 inline uint16_t SubmitScatter(uint32_t jobId, uint16_t pg, const std::vector<std::pair<uint32_t,uint32_t>>& gpus, uint64_t msgSize, uint32_t root = 0);
 inline uint16_t SubmitAllGather(uint32_t jobId, uint16_t pg, const std::vector<std::pair<uint32_t,uint32_t>>& gpus, uint64_t msgSize);
 inline uint16_t SubmitReduceScatter(uint32_t jobId, uint16_t pg, const std::vector<std::pair<uint32_t,uint32_t>>& gpus, uint64_t msgSize);
-inline uint16_t SubmitCollective(uint32_t jobId, CollectiveOp op, uint16_t pg, const std::vector<std::pair<uint32_t,uint32_t>>& gpus, uint64_t msgSize, uint32_t root = 0);
+inline uint16_t SubmitAllToAll(uint32_t jobId, uint16_t pg, const std::vector<std::pair<uint32_t,uint32_t>>& gpus, uint64_t msgSize, uint32_t k = 1, uint32_t ep = 1, uint64_t expert_mem_bytes = 0);
+inline uint16_t SubmitCollective(uint32_t jobId, CollectiveOp op, uint16_t pg, const std::vector<std::pair<uint32_t,uint32_t>>& gpus, uint64_t msgSize, uint32_t root, uint32_t k, uint32_t ep, uint64_t expert_mem_bytes);
 inline void OnMessageFinish(FILE* fout, Ptr<RdmaQueuePair> q);
+
+// Setter for log path (call from NormalNetwork to specify output file)
+inline void SetJidQpLogPath(const std::string &path) {
+  std::lock_guard<std::mutex> lk(g_mutex);
+  g_jid_qp_log_path = path;
+}
 
 std::vector<std::pair<uint32_t,uint32_t>> participants;
 uint64_t msgSize = 1024 * 1024 * 100; // 1 MB
@@ -54,28 +74,34 @@ uint16_t default_pg = 3; // 流优先级
 int need = 128; // 需要的 GPU 数量
 double sim_time = 0.0001; // 模拟时间，单位秒
 
+// Map jobId -> per-job local ranks (0..n-1)
+static std::map<uint32_t, std::vector<uint32_t>> g_job_ranks;
+
+// Global, unique probability table used by all alltoall jobs. If empty,
+// a uniform distribution will be used for the group size when needed.
+static std::vector<double> g_prob_table;
+
+inline void SetGlobalProbTable(const std::vector<double>& table) {
+  std::lock_guard<std::mutex> lk(g_mutex);
+  g_prob_table = table;
+}
+
 inline void Init() {
-  SubmitJob(JID, need, sim_time, msgSize);
-  cout<< "mnCCL: initialized \n";
-  Simulator::Schedule(Seconds(sim_time*2), [](){
-    cclScheduler::ScheduleTask();
-  });
+  // Initialization only; tasks should be submitted by the driver (NormalNetwork)
+  ccl::CclLog("mnCCL: initialized");
+  // schedule one-time scheduler kick to start handling pending queue later
+  Simulator::Schedule(Seconds(sim_time*2), [](){ cclScheduler::ScheduleTask(); });
 }
 
 inline void SubmitJob(uint32_t jobId, int need, double sim_time, uint64_t workload) {
-  if (need <= 0)
-    return;
-    
-  SubmitColJob(CollectiveJob{JID, CollectiveOp::AllReduce, default_pg, static_cast<uint32_t>(need), sim_time, workload, 0});
-  JID = jobId + 1;
-  need -= 16;
-  cout<<"gen collective"<<JID<<endl;
-  SubmitJob(JID, need, sim_time, workload);
+  // Submit a single job (no recursive behavior). Prefer using SubmitColJob
+  // directly from the driver to construct arbitrary job parameters.
+  SubmitColJob(CollectiveJob{jobId, CollectiveOp::AllReduce, default_pg, static_cast<uint32_t>(need), sim_time, workload, 0, 1, 1, 0});
 }
 
 inline void SubmitColJob(const CollectiveJob& job) {
   Simulator::Schedule(Seconds(job.submitTime), [job](){
-    cclScheduler::EnqueuePendingTask(job.jobId, job.op, job.pg, job.need, job.msgSize, job.root);
+    cclScheduler::EnqueuePendingTask(job.jobId, job.op, job.pg, job.need, job.msgSize, job.root, job.k, job.ep, job.expert_mem_bytes);
     cclScheduler::ScheduleTask();
   });
 }
@@ -83,6 +109,7 @@ inline void SubmitColJob(const CollectiveJob& job) {
 inline const char* OpName(CollectiveOp op) {
   switch (op) {
     case CollectiveOp::AllReduce: return "allreduce";
+    case CollectiveOp::AllToAll: return "alltoall";
     case CollectiveOp::Broadcast: return "broadcast";
     case CollectiveOp::Reduce: return "reduce";
     case CollectiveOp::Gather: return "gather";
@@ -143,8 +170,12 @@ inline uint16_t FinishSubmit(uint32_t jobId,
     }
   }
 
-  std::cout << "mnCCL: submitted " << OpName(op) << " JID=" << jobId
-            << " participants=" << gpus.size() << " sends=" << keys.size() << "\n";
+  {
+    std::ostringstream ss;
+    ss << "mnCCL: submitted " << OpName(op) << " JID=" << jobId
+       << " participants=" << gpus.size() << " sends=" << keys.size();
+    ccl::CclLog(ss.str());
+  }
   return jobId;
 }
 
@@ -258,10 +289,92 @@ inline uint16_t SubmitReduceScatter(uint32_t jobId, uint16_t pg, const std::vect
   return FinishSubmit(jobId, CollectiveOp::ReduceScatter, gpus, keys);
 }
 
-inline uint16_t SubmitCollective(uint32_t jobId, CollectiveOp op, uint16_t pg, const std::vector<std::pair<uint32_t,uint32_t>>& gpus, uint64_t msgSize, uint32_t root) {
+// Submit an all-to-all style job: each participant generates `k` flows
+// whose destinations are sampled from a global probability table that is
+// shifted/biased by the sender's local rank. The local ranks for the
+// job are stored in `g_job_ranks[jobId]`.
+inline uint16_t SubmitAllToAll(uint32_t jobId, uint16_t pg, const std::vector<std::pair<uint32_t,uint32_t>>& gpus, uint64_t msgSize, uint32_t k, uint32_t ep, uint64_t expert_mem_bytes) {
+  if (gpus.size() < 2 || (k == 0 && ep == 0))
+    return jobId;
+
+  size_t n = gpus.size();
+  std::vector<uint64_t> keys;
+
+  // store local ranks 0..n-1 for this job
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_job_ranks[jobId].clear();
+    for (uint32_t r = 0; r < n; ++r)
+      g_job_ranks[jobId].push_back(r);
+  }
+
+  // base probability table: use global table if available, otherwise uniform
+  std::vector<double> base;
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!g_prob_table.empty())
+      base = g_prob_table;
+  }
+  if (base.size() < n) {
+    base.assign(n, 1.0);
+  }
+
+  // For expert parallelism: there are `ep` expert types (0..ep-1).
+  // Assign each expert type e to node (e % n). For each expert hosted on
+  // a sender node, generate `k` flows whose destinations are sampled from
+  // a probability table shifted by the expert id.
+  for (size_t s = 0; s < n; ++s) {
+    uint32_t src = gpus[s].first;
+    // collect expert ids hosted on this sender
+    std::vector<uint32_t> experts;
+    for (uint32_t e = 0; e < ep; ++e) {
+      if ((e % n) == s)
+        experts.push_back(e);
+    }
+    if (experts.empty() && k == 0)
+      continue;
+
+    for (uint32_t e : experts) {
+      // build per-expert probability vector by shifting the base table by expert id
+      std::vector<double> probs(n);
+      double sum = 0.0;
+      for (size_t j = 0; j < n; ++j) {
+        probs[j] = base[(j + (e % base.size())) % base.size()];
+        sum += probs[j];
+      }
+      if (sum <= 0.0) {
+        for (size_t j = 0; j < n; ++j) probs[j] = 1.0;
+        sum = (double)n;
+      }
+      for (size_t j = 0; j < n; ++j) probs[j] /= sum;
+
+      std::mt19937 rng(static_cast<uint32_t>(jobId ^ (s * 16777619u) ^ (e * 92717u)));
+      std::discrete_distribution<int> dist(probs.begin(), probs.end());
+
+      for (uint32_t t = 0; t < k; ++t) {
+        int dst_idx = dist(rng);
+        int tries = 0;
+        while (dst_idx == (int)s && tries < 3) {
+          dst_idx = dist(rng);
+          ++tries;
+        }
+        if (dst_idx == (int)s)
+          continue;
+        uint32_t dst = gpus[dst_idx].first;
+        SubmitFlow(pg, src, dst, msgSize, keys);
+      }
+    }
+  }
+
+  return FinishSubmit(jobId, CollectiveOp::AllToAll, gpus, keys);
+}
+
+inline uint16_t SubmitCollective(uint32_t jobId, CollectiveOp op, uint16_t pg, const std::vector<std::pair<uint32_t,uint32_t>>& gpus, uint64_t msgSize, uint32_t root, uint32_t k, uint32_t ep, uint64_t expert_mem_bytes) {
   switch (op) {
     case CollectiveOp::AllReduce:
       return SubmitAllReduce(jobId, pg, gpus, msgSize);
+    case CollectiveOp::AllToAll:
+      return SubmitAllToAll(jobId, pg, gpus, msgSize, k, ep, expert_mem_bytes);
     case CollectiveOp::Broadcast:
       return SubmitBroadcast(jobId, pg, gpus, msgSize, root);
     case CollectiveOp::Reduce:
@@ -300,6 +413,16 @@ inline void OnMessageFinish(FILE* /*fout*/, Ptr<RdmaQueuePair> q) {
         return; // not found, maybe not an mnCCL message
       jobId = it_key->second;
 
+      // record this QP under the jobId for logging/inspection (avoid dupes)
+      auto &vec = g_JID2QPs[jobId];
+      bool found = false;
+      for (auto &existing_q : vec) {
+        if (existing_q == q) { found = true; break; }
+      }
+      if (!found) {
+        vec.push_back(q);
+      }
+
       auto it = g_outstanding.find(jobId);
       if (it == g_outstanding.end())
         return;
@@ -320,7 +443,43 @@ inline void OnMessageFinish(FILE* /*fout*/, Ptr<RdmaQueuePair> q) {
 
     if (finished) {
       cclScheduler::ReleaseGPUs(alloc);
-      std::cout << "mnCCL: JID=" << jobId << " finished at " << Simulator::Now().GetNanoSeconds() << "ns\n";
+      cclScheduler::ReleaseExpertAlloc(jobId);
+      // print and clear any recorded QPs for this JID
+      {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        auto itq = g_JID2QPs.find(jobId);
+        if (itq != g_JID2QPs.end()) {
+          if (!g_jid_qp_log_path.empty()) {
+            std::ofstream ofs(g_jid_qp_log_path, std::ofstream::app);
+              if (ofs) {
+                // If file is new, write a header line
+                bool need_header = false;
+                // check if file was just created by trying to open for read
+                std::ifstream ifs(g_jid_qp_log_path);
+                if (!ifs.good())
+                  need_header = true;
+                ifs.close();
+                if (need_header) {
+                  ofs << "timestamp_ns,jobId,srcNode,dstNode,pg,sport,dport,qp_start_time_step\n";
+                }
+                // write each QP as CSV: timestamp_ns,jobId,node_src,node_dst,pg,sport,dport,qp_start_time_step
+                for (auto &qp : itq->second) {
+                  uint64_t ts = ns3::Simulator::Now().GetNanoSeconds();
+                  uint32_t sid = ip_to_node_id(qp->sip);
+                  uint32_t did = ip_to_node_id(qp->dip);
+                  ofs << ts << "," << jobId << "," << sid << "," << did << "," << qp->m_pg << "," << qp->sport << "," << qp->dport << "," << qp->startTime.GetTimeStep() << "\n";
+                }
+                ofs.close();
+              }
+          }
+          g_JID2QPs.erase(itq);
+        }
+      }
+      {
+        std::ostringstream ss;
+        ss << "mnCCL: JID=" << jobId << " finished";
+        ccl::CclLog(ss.str());
+      }
     }
 }
 
