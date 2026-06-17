@@ -14,6 +14,7 @@
 #include <iostream>
 #include <sstream>
 #include <cstdint>
+#include <string>
 #include "common.h"
 #include "ccl_log.h"
 
@@ -31,13 +32,7 @@ enum class CollectiveOp : uint8_t {
   AllGather,
   ReduceScatter
 };
-inline uint16_t SubmitAllReduce(uint32_t jobId,
-                                uint16_t pg,
-                                const std::vector<std::pair<uint32_t,uint32_t>>& gpus,
-                                uint64_t msgSize,
-                                bool releaseOnFinish = true,
-                                bool recordFlowFinish = true,
-                                bool logSubmit = true);
+
 inline uint16_t SubmitCollective(uint32_t jobId,
                                  CollectiveOp op,
                                  uint16_t pg,
@@ -125,6 +120,14 @@ struct PlacementRequest {
   uint64_t expert_mem_bytes;
 };
 
+struct ExpertPlacementRequest {
+  uint32_t ownerId;
+  PlacementKind kind;
+  uint32_t expert_num;
+  std::vector<std::pair<uint32_t,uint32_t>> gpus;
+};
+
+// ===== SCHEDULING POLICY INTERFACE: PD placement / need placement =====
 using NeedPlacementPolicy =
   std::function<std::vector<std::pair<uint32_t, uint32_t>>(
     const PlacementRequest&,
@@ -135,6 +138,11 @@ using NeedPlacementPolicy =
     uint32_t,
     uint32_t)>;
 
+// ===== SCHEDULING POLICY INTERFACE: expert placement on selected PD GPUs =====
+using ExpertPlacementPolicy =
+  std::function<std::vector<std::vector<std::pair<uint32_t,uint32_t>>>(
+    const ExpertPlacementRequest&)>;
+
 // Forward declarations for functions used before their full definitions.
 inline void ScheduleTask();
 inline PendingTask SchedulePendingTasks();
@@ -142,9 +150,11 @@ inline std::vector<std::vector<std::pair<uint32_t,uint32_t>>> AssignExperts(uint
 inline void ReleaseExpertAlloc(uint32_t jobId);
 // Return flattened list of all <node,gpu> assigned to the job (across all experts)
 inline std::vector<std::pair<uint32_t,uint32_t>> GetExpertAlloc(uint32_t jobId);
+inline std::vector<std::pair<uint32_t,uint32_t>> GetExpertReplicas(uint32_t jobId, uint32_t expertId);
 inline const char* PlacementKindName(PlacementKind kind);
 inline uint64_t MakeGpuKey(uint32_t node, uint32_t gpu);
 inline uint32_t ExpertsOnGpuIndex(uint32_t expert_num, uint32_t ngpus, uint32_t idx, uint64_t expert_mem_bytes);
+inline std::vector<std::vector<std::pair<uint32_t,uint32_t>>> RoundRobinExpertPlacementPolicy(const ExpertPlacementRequest& req);
 inline std::vector<std::pair<uint32_t, uint32_t>> FillNeedPlacementPolicy(
   const PlacementRequest& req,
   const std::vector<std::vector<uint64_t>>& mem_used,
@@ -170,6 +180,7 @@ inline uint64_t GetMinRemainingMemory(const std::vector<std::pair<uint32_t,uint3
 inline uint64_t GetAverageRemainingMemory(const std::vector<std::pair<uint32_t,uint32_t>>& gpus);
 inline uint64_t GetAverageCapacity(const std::vector<std::pair<uint32_t,uint32_t>>& gpus);
 inline void SetNeedPlacementPolicy(NeedPlacementPolicy policy);
+inline void SetExpertPlacementPolicy(ExpertPlacementPolicy policy);
 using AllocationPolicy =
   std::function<std::vector<std::pair<uint32_t, uint32_t>>(
     uint32_t,
@@ -191,6 +202,7 @@ inline void DequeuePendingTask();
 
 static AllocationPolicy s_allocate_policy = FillAllocateGPUs;
 static NeedPlacementPolicy s_need_placement_policy = FillNeedPlacementPolicy;
+static ExpertPlacementPolicy s_expert_placement_policy = RoundRobinExpertPlacementPolicy;
 static NeedUpdateCallback s_need_update_callback;
 
 // Enqueue a pending task (external code should call this when allocation
@@ -294,39 +306,64 @@ inline void Init(uint32_t num_nodes, uint32_t gpus_per_server, uint64_t default_
   s_expert_alloc.clear();
 }
 
-// Assign experts (0..expert_num-1) to the provided GPUs. Default policy: round-robin
-// across the provided `gpus` vector. Stores mapping in `s_expert_alloc` under
-// `jobId` and returns the mapping vector of size `expert_num`.
+inline std::vector<std::vector<std::pair<uint32_t,uint32_t>>> RoundRobinExpertPlacementPolicy(const ExpertPlacementRequest& req) {
+  std::vector<std::vector<std::pair<uint32_t,uint32_t>>> res;
+  if (req.gpus.empty() || req.expert_num == 0)
+    return res;
+  res.assign(req.expert_num, {});
+  uint32_t need = static_cast<uint32_t>(req.gpus.size());
+  if (need >= req.expert_num) {
+    for (uint32_t i = 0; i < need; ++i) {
+      uint32_t expert_id = i % req.expert_num;
+      res[expert_id].push_back(req.gpus[i]);
+    }
+  } else {
+    uint32_t e = 0;
+    for (; e < need && e < req.expert_num; ++e) {
+      res[e].push_back(req.gpus[e]);
+    }
+    for (; e < req.expert_num; ++e) {
+      uint32_t target_gpu = e % need;
+      res[e].push_back(req.gpus[target_gpu]);
+    }
+  }
+  return res;
+}
+
+// Assign experts (0..expert_num-1) to the provided GPUs through the configured
+// expert placement policy. Stores mapping in `s_expert_alloc` under `jobId`.
 inline std::vector<std::vector<std::pair<uint32_t,uint32_t>>> AssignExperts(uint32_t jobId, uint32_t expert_num, const std::vector<std::pair<uint32_t,uint32_t>>& gpus) {
   std::vector<std::vector<std::pair<uint32_t,uint32_t>>> res;
   if (gpus.empty() || expert_num == 0)
     return res;
+  PlacementKind kind = PlacementKind::Generic;
   {
     std::lock_guard<std::mutex> lk(s_mutex);
-    // prepare per-expert vector
-    res.assign(expert_num, {});
-    uint32_t need = static_cast<uint32_t>(gpus.size());
-    if (need >= expert_num) {
-      // distribute GPUs to experts round-robin so an expert may have multiple GPUs
-      for (uint32_t i = 0; i < need; ++i) {
-        uint32_t expert_id = i % expert_num;
-        res[expert_id].push_back(gpus[i]);
-      }
-    } else {
-      // need < expert_num: ensure each GPU gets at least one expert, and assign remaining
-      // experts to GPUs in round-robin so every expert is placed at least once.
-      // First assign one expert per GPU
-      uint32_t e = 0;
-      for (; e < need && e < expert_num; ++e) {
-        res[e].push_back(gpus[e]);
-      }
-      // Assign remaining experts to GPUs in round-robin (GPU index j)
-      for (; e < expert_num; ++e) {
-        uint32_t target_gpu = e % need;
-        res[e].push_back(gpus[target_gpu]);
-      }
-    }
+    auto kind_it = s_placement_kind_by_owner.find(jobId);
+    if (kind_it != s_placement_kind_by_owner.end())
+      kind = kind_it->second;
+    auto policy = s_expert_placement_policy ? s_expert_placement_policy : RoundRobinExpertPlacementPolicy;
+    res = policy(ExpertPlacementRequest{jobId, kind, expert_num, gpus});
     s_expert_alloc[jobId] = res;
+  }
+
+  {
+    std::ostringstream ss;
+    ss << "Scheduler: expert placement placement_owner=" << jobId
+       << " kind=" << PlacementKindName(kind)
+       << " expert_num=" << expert_num
+       << " experts=[";
+    for (size_t e = 0; e < res.size(); ++e) {
+      if (e) ss << ";";
+      ss << e << "->{";
+      for (size_t r = 0; r < res[e].size(); ++r) {
+        if (r) ss << ",";
+        ss << res[e][r].first << ":" << res[e][r].second;
+      }
+      ss << "}";
+    }
+    ss << "]";
+    ccl::CclLog(ss.str());
   }
   return res;
 }
@@ -348,6 +385,14 @@ inline std::vector<std::pair<uint32_t,uint32_t>> GetExpertAlloc(uint32_t jobId) 
       flat.push_back(p);
   }
   return flat;
+}
+
+inline std::vector<std::pair<uint32_t,uint32_t>> GetExpertReplicas(uint32_t jobId, uint32_t expertId) {
+  std::lock_guard<std::mutex> lk(s_mutex);
+  auto it = s_expert_alloc.find(jobId);
+  if (it == s_expert_alloc.end() || expertId >= it->second.size())
+    return {};
+  return it->second[expertId];
 }
 
 inline const char* PlacementKindName(PlacementKind kind) {
@@ -405,6 +450,11 @@ inline std::vector<std::pair<uint32_t, uint32_t>> FillNeedPlacementPolicy(
 inline void SetNeedPlacementPolicy(NeedPlacementPolicy policy) {
   std::lock_guard<std::mutex> lk(s_mutex);
   s_need_placement_policy = policy ? policy : FillNeedPlacementPolicy;
+}
+
+inline void SetExpertPlacementPolicy(ExpertPlacementPolicy policy) {
+  std::lock_guard<std::mutex> lk(s_mutex);
+  s_expert_placement_policy = policy ? policy : RoundRobinExpertPlacementPolicy;
 }
 
 inline void SetNeedUpdateCallback(NeedUpdateCallback cb) {
@@ -486,12 +536,9 @@ inline std::vector<std::pair<uint32_t, uint32_t>> TryPlaceNeed(const PlacementRe
     ss << "Scheduler: placed placement_owner=" << req.ownerId
        << " kind=" << PlacementKindName(req.kind)
        << " need=" << req.need
-       << " expert_num=" << req.expert_num << " gpus=[";
-    for (size_t i = 0; i < allocated.size(); ++i) {
-      if (i) ss << ";";
-      ss << allocated[i].first << ":" << allocated[i].second;
-    }
-    ss << "]";
+       << " expert_num=" << req.expert_num
+       << " selected_gpus=" << allocated.size()
+       << " detail=see expert placement";
     ccl::CclLog(ss.str());
   }
   return allocated;

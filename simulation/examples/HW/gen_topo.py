@@ -1,7 +1,7 @@
 with open('/home/kumo/workspace/ns-3-alibabacloud/' \
 'simulation/examples/HW/topo.txt', 'w') as f:
-    M = 4
-    N = 16
+    M = 2
+    N = 128
     B = '200Gbps'
     G = 128//N
 
@@ -14,7 +14,8 @@ with open('/home/kumo/workspace/ns-3-alibabacloud/' \
     L_L0 = '200ns'
     L_L1 = '600ns'
     L_L2 = '1000ns'
-    LINKS = 122752
+    LINKS = EPS*(EPS-1) + 96*M*N*G + 448*N*G
+    B_OCS = '10000Gbps'
 
     f.write(f'{NODES+SS+EPS} 1 0 {SS+EPS} {LINKS} X000 8\n')
     for i in range(SS+EPS):
@@ -52,4 +53,4 @@ with open('/home/kumo/workspace/ns-3-alibabacloud/' \
             if i != j:
                 index = NODES + SS + i
                 idx_eps = NODES + SS + j
-                f.write(f'{index} {idx_eps} {B} {L_L2} 0\n')
+                f.write(f'{index} {idx_eps} {B_OCS} {L_L2} 0\n')

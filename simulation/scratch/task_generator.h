@@ -15,33 +15,50 @@ namespace taskGenerator {
 
 struct PipelineRuntimeParams {
   uint16_t pg = mnccl::default_pg;
-  uint32_t need_prefill = 64;
-  uint32_t need_decode = 64;
-  uint32_t expert_num = 128;
-  uint32_t kflows = 2;
-  uint32_t single_token_length = 64;
+  uint32_t need_prefill = 128;
+  uint32_t need_decode = 32;
+  uint32_t expert_num = 64;
+  uint32_t kflows = 4;
+  uint32_t single_token_length = 2;
   uint64_t expert_mem_bytes = 64ULL * 1024ULL * 1024ULL;
-  uint64_t prefill_unit_msg_size = 1ULL * 1024ULL * 1024ULL;
-  uint64_t prefill_alltoall_msg_size = 512ULL * 1024ULL;
-  uint64_t token_msg_size = 512ULL * 1024ULL;
-  uint64_t base_decode_compute_delay_ns = 50000;
+  uint64_t token_msg_size = 2;
+  uint64_t base_decode_compute_delay_ns = 1;
 };
 
 struct PipelineTaskDistributionParams {
-  uint32_t num_tasks = 5;
+  uint32_t num_tasks = 10;
   uint32_t seed = 12345;
-  uint32_t prefill_length_min = 512;
-  uint32_t prefill_length_max = 2048;
-  uint32_t decode_length_min = 64;
-  uint32_t decode_length_max = 192;
+  uint32_t prefill_length_min = 8192;
+  uint32_t prefill_length_max = 16384;
+  uint32_t decode_length_min = 256;
+  uint32_t decode_length_max = 2048;
   double first_submit_time = 0.00001;
-  double submit_interval = 0.00001;
+  double submit_interval = 0.0001;
 };
 
 struct PipelineWorkloadParams {
   PipelineRuntimeParams runtime;
   PipelineTaskDistributionParams distribution;
+
+  // ===== SCHEDULING POLICY INTERFACE: global need update on task events =====
   cclScheduler::NeedUpdateCallback need_update_callback;
+
+  // ===== SCHEDULING POLICY INTERFACE: PD node placement =====
+  cclScheduler::NeedPlacementPolicy need_placement_policy;
+
+  // ===== SCHEDULING POLICY INTERFACE: expert placement within selected PD GPUs =====
+  cclScheduler::ExpertPlacementPolicy expert_placement_policy;
+
+  // ===== SCHEDULING POLICY INTERFACE: per-GPU local flow queue scheduling =====
+  mnccl::LocalFlowSchedulePolicy local_flow_schedule_policy;
+
+  // ===== SCHEDULING POLICY INTERFACE: same-rank expert replica route selection =====
+  mnccl::ExpertRoutePolicy expert_route_policy;
+
+  // ===== SCHEDULING POLICY INTERFACE: PD pipeline split point =====
+  mnccl::PdSplitPolicy pd_split_policy;
+
+  double simulation_stop_time = 1000.0;
   bool print_submissions = true;
   std::ostream* output = &std::cout;
 };
@@ -66,8 +83,6 @@ inline mnccl::RuntimeConfig MakeRuntimeConfig(const PipelineRuntimeParams& param
       params.kflows,
       params.single_token_length,
       params.expert_mem_bytes,
-      params.prefill_unit_msg_size,
-      params.prefill_alltoall_msg_size,
       params.token_msg_size,
       params.base_decode_compute_delay_ns};
 }
@@ -121,6 +136,11 @@ inline void RegisterPipelineWorkload(const PipelineWorkloadParams& params) {
   ConfigurePipelineRuntime(params.runtime);
   cclScheduler::SetNeedUpdateCallback(
       params.need_update_callback ? params.need_update_callback : DefaultNeedUpdateCallback());
+  cclScheduler::SetNeedPlacementPolicy(params.need_placement_policy);
+  cclScheduler::SetExpertPlacementPolicy(params.expert_placement_policy);
+  mnccl::SetLocalFlowSchedulePolicy(params.local_flow_schedule_policy);
+  mnccl::SetExpertRoutePolicy(params.expert_route_policy);
+  mnccl::SetPdSplitPolicy(params.pd_split_policy);
   auto tasks = GenerateCurrentPipelineTaskDistribution(params.distribution);
   SubmitPipelineTasks(tasks, params.print_submissions, params.output);
 }
