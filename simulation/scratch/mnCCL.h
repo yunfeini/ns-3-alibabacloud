@@ -36,9 +36,16 @@ struct FlowFinishRecord {
   uint64_t standaloneFct;
 };
 
+struct PipelineLatencyStats {
+  uint64_t completedTasks = 0;
+  uint64_t sumTtftNs = 0;
+  uint64_t sumTpotNs = 0;
+};
+
 // Map JID -> completed mnCCL messages. Stored for logging when the whole job
 // finishes. Protected by g_mutex.
 static std::map<uint32_t, std::vector<FlowFinishRecord>> g_JID2FlowFinishes;
+static PipelineLatencyStats g_pipeline_latency_stats;
 
 // Mutex protecting the above maps
 static std::mutex g_mutex;
@@ -56,6 +63,7 @@ struct CollectiveJob {
   uint32_t k;
   uint32_t expert_num;
   uint64_t expert_mem_bytes;
+  uint32_t expert_per_gpu;
 };
 
 struct PipelineTask {
@@ -70,6 +78,7 @@ struct RuntimeConfig {
   uint32_t need_prefill;
   uint32_t need_decode;
   uint32_t expert_num;
+  uint32_t expert_per_gpu;
   uint32_t k;
   uint32_t single_token_length;
   uint64_t expert_mem_bytes;
@@ -97,6 +106,7 @@ struct PipelineTaskState {
   uint32_t decodePlacementOwner;
   uint32_t actualNeedPrefill;
   uint32_t actualNeedDecode;
+  RuntimeConfig dispatchConfig;
   uint32_t prefillAllReduceJobId;
   uint32_t prefillAllToAllJobId;
   uint32_t kvCacheJobId;
@@ -113,6 +123,7 @@ struct PipelineTaskState {
   uint64_t lastTokenFinishNs;
   std::vector<std::pair<uint32_t,uint32_t>> prefillGpus;
   std::vector<std::pair<uint32_t,uint32_t>> decodeGpus;
+  bool placementAttempted;
   bool prefillPlacementReleased;
   bool decodePlacementReleased;
   bool kvCacheTransferred;
@@ -164,6 +175,8 @@ using PdSplitPolicy =
 inline void SubmitJob(uint32_t jobId, int need, double sim_time, uint64_t workload);
 inline void SubmitColJob(const CollectiveJob& job);
 inline void SubmitPipelineTask(const PipelineTask& task);
+inline bool PreparePipelineTaskPlacement(uint32_t taskId);
+inline void RetryWaitingPipelineTasks();
 inline void TryStartPipelineTask(uint32_t taskId);
 inline void StartPrefillAllReduce(PipelineTaskState& state);
 inline void StartPrefillAllToAll(PipelineTaskState& state);
@@ -176,9 +189,13 @@ inline void FinishPipelineTask(uint32_t taskId);
 inline void LogPipelineTaskSummary(const PipelineTaskState& state,
                                    uint64_t nowNs,
                                    const RuntimeConfig& cfg,
-                                   bool completed);
+                                   bool completed,
+                                   bool accumulateStats);
 inline void LogPipelineSummariesAtSimulationEnd();
 inline uint64_t DecodeComputeDelayNs(const PipelineTaskState& state);
+inline bool ExpertMapReady(
+    const std::vector<std::vector<std::pair<uint32_t,uint32_t>>>& expertMap,
+    uint32_t expertNum);
 inline void ConfigureRuntime(const RuntimeConfig& cfg);
 inline void SetGlobalPipelineNeeds(uint32_t needPrefill, uint32_t needDecode);
 inline void SetModelParallelConfig(uint32_t expertNum);
@@ -192,16 +209,31 @@ inline uint32_t ResolvePrefillSideDecodeIterations(const PipelineTask& task,
                                                    const RuntimeConfig& cfg,
                                                    uint32_t decodeIterations);
 inline RuntimeConfig GetRuntimeConfig();
+inline RuntimeConfig TaskRuntimeConfig(const PipelineTaskState& state);
 inline RuntimeConfig RefreshRuntimeConfig(cclScheduler::NeedEvent event, const PipelineTask& task);
 inline uint64_t PrefillAllReduceMsgSize(const PipelineTask& task);
+inline uint64_t PrefillAllReduceMsgSize(const PipelineTask& task, const RuntimeConfig& cfg);
 inline uint64_t PrefillAllToAllMsgSize(const PipelineTask& task);
+inline uint64_t PrefillAllToAllMsgSize(const PipelineTask& task, const RuntimeConfig& cfg);
 inline uint64_t KvCacheMsgSize(const PipelineTask& task);
+inline uint64_t KvCacheMsgSize(const PipelineTask& task, const RuntimeConfig& cfg);
 inline uint64_t TokenBytes(uint32_t tokens);
+inline uint64_t TokenBytes(const RuntimeConfig& cfg, uint32_t tokens);
 inline uint32_t DecodeIterationsForTask(const PipelineTask& task);
 inline uint64_t DecodeIterationMsgSize(const PipelineTaskState& state);
 inline void OnCollectiveFinished(uint32_t jobId);
 inline uint64_t MakeGpuKey(uint32_t node, uint32_t gpu);
 inline void TryScheduleLocalGpu(uint64_t localGpuKey);
+inline size_t StaticLocalFlowScheduleIndex(const std::vector<LocalFlowTask>& queue);
+inline void PrepareExpertRoutesForPlacement(uint32_t placementOwner,
+                                            PipelineStage stage,
+                                            cclScheduler::PlacementKind pdKind,
+                                            const RuntimeConfig& cfg);
+inline std::pair<uint32_t,uint32_t> ResolveCachedExpertRoute(
+    uint32_t placementOwner,
+    const std::pair<uint32_t,uint32_t>& sourceGpu,
+    uint32_t dstExpert,
+    const std::vector<std::pair<uint32_t,uint32_t>>& candidates);
 inline void DispatchLocalFlow(const LocalFlowTask& task);
 inline void SubmitFlow(uint16_t pg,
                        const std::pair<uint32_t,uint32_t>& srcGpu,
@@ -299,12 +331,14 @@ static std::map<uint32_t, bool> g_log_collective_submit;
 static std::map<uint64_t, std::vector<LocalFlowTask>> g_local_flow_queues;
 static std::map<uint64_t, bool> g_local_flow_active;
 static std::map<uint64_t, uint64_t> g_flow_key_to_local_gpu;
+static std::map<uint32_t, std::map<uint64_t, std::map<uint32_t, std::pair<uint32_t,uint32_t>>>> g_expert_route_cache;
 static uint64_t g_local_flow_sequence = 0;
 static LocalFlowSchedulePolicy g_local_flow_schedule_policy = FifoLocalFlowSchedulePolicy;
 static ExpertRoutePolicy g_expert_route_policy = RandomExpertRoutePolicy;
 static PdSplitPolicy g_pd_split_policy = NoPrefillSideDecodeSplitPolicy;
 static RuntimeConfig g_runtime_config{
     default_pg,
+    1,
     1,
     1,
     1,
@@ -381,6 +415,97 @@ inline void SetExpertRoutePolicy(ExpertRoutePolicy policy) {
   g_expert_route_policy = policy ? policy : RandomExpertRoutePolicy;
 }
 
+inline size_t StaticLocalFlowScheduleIndex(const std::vector<LocalFlowTask>& queue) {
+  if (queue.empty())
+    return 0;
+
+  size_t bestIdx = 0;
+  auto score = [](const LocalFlowTask& task) {
+    uint8_t priority = 1;
+    if (task.stage == PipelineStage::PrefillAllReduce || task.stage == PipelineStage::PrefillAllToAll)
+      priority = 0;
+    else if (task.stage == PipelineStage::DecodeAllReduce || task.stage == PipelineStage::DecodeAllToAll)
+      priority = 1;
+    else
+      priority = 2;
+    return std::make_tuple(priority, task.msgSize, task.arrivalTimeNs, task.sequence);
+  };
+  auto bestScore = score(queue.front());
+  for (size_t i = 1; i < queue.size(); ++i) {
+    auto curScore = score(queue[i]);
+    if (curScore < bestScore) {
+      bestScore = curScore;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
+inline std::pair<uint32_t,uint32_t> ResolveCachedExpertRoute(
+    uint32_t placementOwner,
+    const std::pair<uint32_t,uint32_t>& sourceGpu,
+    uint32_t dstExpert,
+    const std::vector<std::pair<uint32_t,uint32_t>>& candidates) {
+  if (candidates.empty())
+    return sourceGpu;
+
+  uint64_t sourceKey = MakeGpuKey(sourceGpu.first, sourceGpu.second);
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto ownerIt = g_expert_route_cache.find(placementOwner);
+    if (ownerIt != g_expert_route_cache.end()) {
+      auto srcIt = ownerIt->second.find(sourceKey);
+      if (srcIt != ownerIt->second.end()) {
+        auto dstIt = srcIt->second.find(dstExpert);
+        if (dstIt != srcIt->second.end())
+          return dstIt->second;
+      }
+    }
+  }
+
+  for (const auto& candidate : candidates) {
+    if (candidate != sourceGpu)
+      return candidate;
+  }
+  return candidates.front();
+}
+
+inline void PrepareExpertRoutesForPlacement(uint32_t placementOwner,
+                                            PipelineStage stage,
+                                            cclScheduler::PlacementKind pdKind,
+                                            const RuntimeConfig& cfg) {
+  std::map<uint64_t, std::map<uint32_t, std::pair<uint32_t,uint32_t>>> ownerCache;
+  ExpertRoutePolicy routePolicy;
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    routePolicy = g_expert_route_policy ? g_expert_route_policy : RandomExpertRoutePolicy;
+  }
+
+  for (uint32_t sourceExpert = 0; sourceExpert < cfg.expert_num; ++sourceExpert) {
+    auto sourceReplicas = cclScheduler::GetExpertReplicas(placementOwner, sourceExpert);
+    for (const auto& sourceGpu : sourceReplicas) {
+      uint64_t sourceKey = MakeGpuKey(sourceGpu.first, sourceGpu.second);
+      auto& perSource = ownerCache[sourceKey];
+      for (uint32_t dstExpert = 0; dstExpert < cfg.expert_num; ++dstExpert) {
+        auto candidates = cclScheduler::GetExpertReplicas(placementOwner, dstExpert);
+        if (candidates.empty())
+          continue;
+        perSource[dstExpert] = routePolicy(ExpertRouteRequest{
+            0,
+            placementOwner,
+            dstExpert,
+            stage,
+            pdKind,
+            sourceGpu,
+            candidates});
+      }
+    }
+  }
+
+  std::lock_guard<std::mutex> lk(g_mutex);
+  g_expert_route_cache[placementOwner] = std::move(ownerCache);
+}
+
 // ===== SCHEDULING POLICY INTERFACE: PD pipeline split point =====
 // Return how many decode-token iterations should run on the prefill placement
 // before KV cache is transferred to the decode placement. Default is 0, which
@@ -412,16 +537,24 @@ inline RuntimeConfig GetRuntimeConfig() {
   return g_runtime_config;
 }
 
+inline RuntimeConfig TaskRuntimeConfig(const PipelineTaskState& state) {
+  return state.dispatchConfig;
+}
+
 inline RuntimeConfig RefreshRuntimeConfig(cclScheduler::NeedEvent event, const PipelineTask& task) {
   RuntimeConfig cfg = GetRuntimeConfig();
+  if (event != cclScheduler::NeedEvent::TaskDispatch)
+    return cfg;
   cclScheduler::NeedState state{
       cfg.need_prefill,
       cfg.need_decode,
-      cfg.expert_num};
+      cfg.expert_num,
+      cfg.expert_per_gpu};
   cclScheduler::NotifyNeedEvent(event, task.taskId, task.prefillLength, task.decodeLength, state);
   cfg.need_prefill = state.need_prefill;
   cfg.need_decode = state.need_decode;
   cfg.expert_num = state.expert_num;
+  cfg.expert_per_gpu = state.expert_per_gpu;
   ConfigureRuntime(cfg);
   return cfg;
 }
@@ -431,16 +564,32 @@ inline uint64_t TokenBytes(uint32_t tokens) {
   return cfg.token_msg_size * static_cast<uint64_t>(std::max(1u, tokens));
 }
 
+inline uint64_t TokenBytes(const RuntimeConfig& cfg, uint32_t tokens) {
+  return cfg.token_msg_size * static_cast<uint64_t>(std::max(1u, tokens));
+}
+
 inline uint64_t PrefillAllReduceMsgSize(const PipelineTask& task) {
   return TokenBytes(task.prefillLength);
+}
+
+inline uint64_t PrefillAllReduceMsgSize(const PipelineTask& task, const RuntimeConfig& cfg) {
+  return TokenBytes(cfg, task.prefillLength);
 }
 
 inline uint64_t PrefillAllToAllMsgSize(const PipelineTask& task) {
   return TokenBytes(task.prefillLength);
 }
 
+inline uint64_t PrefillAllToAllMsgSize(const PipelineTask& task, const RuntimeConfig& cfg) {
+  return TokenBytes(cfg, task.prefillLength);
+}
+
 inline uint64_t KvCacheMsgSize(const PipelineTask& task) {
   return TokenBytes(task.prefillLength);
+}
+
+inline uint64_t KvCacheMsgSize(const PipelineTask& task, const RuntimeConfig& cfg) {
+  return TokenBytes(cfg, task.prefillLength);
 }
 
 inline uint32_t DecodeIterationsForTask(const PipelineTask& task) {
@@ -448,8 +597,19 @@ inline uint32_t DecodeIterationsForTask(const PipelineTask& task) {
 }
 
 inline uint64_t DecodeIterationMsgSize(const PipelineTaskState& state) {
-  (void)state;
-  return TokenBytes(1);
+  return TokenBytes(TaskRuntimeConfig(state), 1);
+}
+
+inline bool ExpertMapReady(
+    const std::vector<std::vector<std::pair<uint32_t,uint32_t>>>& expertMap,
+    uint32_t expertNum) {
+  if (expertMap.size() != expertNum)
+    return false;
+  for (const auto& replicas : expertMap) {
+    if (replicas.empty())
+      return false;
+  }
+  return true;
 }
 
 inline void Init() {
@@ -462,17 +622,29 @@ inline void Init() {
 inline void SubmitJob(uint32_t jobId, int need, double sim_time, uint64_t workload) {
   // Submit a single job (no recursive behavior). Prefer using SubmitColJob
   // directly from the driver to construct arbitrary job parameters.
-  SubmitColJob(CollectiveJob{jobId, CollectiveOp::AllReduce, default_pg, static_cast<uint32_t>(need), sim_time, workload, 0, 1, 1, 0});
+  SubmitColJob(CollectiveJob{
+      jobId, CollectiveOp::AllReduce, default_pg, static_cast<uint32_t>(need),
+      sim_time, workload, 0, 1, 1, 0, 1});
 }
 
 inline void SubmitColJob(const CollectiveJob& job) {
   Simulator::Schedule(Seconds(job.submitTime), [job](){
-    cclScheduler::EnqueuePendingTask(job.jobId, job.op, job.pg, job.need, job.msgSize, job.root, job.k, job.expert_num, job.expert_mem_bytes);
+    cclScheduler::EnqueuePendingTask(job.jobId,
+                                     job.op,
+                                     job.pg,
+                                     job.need,
+                                     job.msgSize,
+                                     job.root,
+                                     job.k,
+                                     job.expert_num,
+                                     job.expert_mem_bytes,
+                                     job.expert_per_gpu);
     cclScheduler::ScheduleTask();
   });
 }
 
 inline void SubmitPipelineTask(const PipelineTask& task) {
+  RuntimeConfig initialCfg = GetRuntimeConfig();
   {
     std::lock_guard<std::mutex> lk(g_mutex);
     PipelineTaskState state{};
@@ -481,9 +653,11 @@ inline void SubmitPipelineTask(const PipelineTask& task) {
     state.decodePlacementOwner = PID++;
     state.decodeIterations = DecodeIterationsForTask(task);
     state.prefillSideDecodeIterations = 0;
+    state.placementAttempted = false;
     state.prefillPlacementReleased = false;
     state.decodePlacementReleased = false;
     state.kvCacheTransferred = false;
+    state.dispatchConfig = initialCfg;
     g_pipeline_tasks[task.taskId] = state;
   }
 
@@ -499,6 +673,7 @@ inline void SubmitPipelineTask(const PipelineTask& task) {
         it->second.startTimeNs = Simulator::Now().GetNanoSeconds();
         it->second.decodeIterations = decodeIterations;
         it->second.prefillSideDecodeIterations = prefillSideDecodeIterations;
+        it->second.dispatchConfig = cfg;
       }
     }
     {
@@ -507,14 +682,140 @@ inline void SubmitPipelineTask(const PipelineTask& task) {
          << " dispatch need_prefill=" << cfg.need_prefill
          << " need_decode=" << cfg.need_decode
          << " expert_num=" << cfg.expert_num
+         << " expert_per_gpu=" << cfg.expert_per_gpu
          << " prefill_length=" << task.prefillLength
          << " decode_length=" << task.decodeLength
          << " single_token_length=" << cfg.single_token_length
          << " prefill_side_decode_iterations=" << prefillSideDecodeIterations;
       ccl::CclLog(ss.str());
     }
+    if (!PreparePipelineTaskPlacement(task.taskId)) {
+      ccl::CclLog("mnCCL: pipeline task " + std::to_string(task.taskId) +
+                  " dispatch placement failed; waiting for a future task-event policy decision");
+      return;
+    }
     TryStartPipelineTask(task.taskId);
   });
+}
+
+inline bool PreparePipelineTaskPlacement(uint32_t taskId) {
+  PipelineTaskState state;
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto it = g_pipeline_tasks.find(taskId);
+    if (it == g_pipeline_tasks.end())
+      return false;
+    state = it->second;
+  }
+
+  auto cfg = TaskRuntimeConfig(state);
+  auto prefillGpus = cclScheduler::TryPlaceNeed(
+      state.prefillPlacementOwner,
+      cclScheduler::PlacementKind::Prefill,
+      cfg.need_prefill,
+      cfg.expert_num,
+      cfg.expert_mem_bytes,
+      cfg.expert_per_gpu);
+  if (prefillGpus.size() != cfg.need_prefill)
+    return false;
+
+  auto prefillExpertMap = cclScheduler::AssignExperts(
+      state.prefillPlacementOwner,
+      cfg.expert_num,
+      cfg.expert_mem_bytes,
+      cfg.expert_per_gpu,
+      prefillGpus);
+  if (!ExpertMapReady(prefillExpertMap, cfg.expert_num)) {
+    cclScheduler::ReleasePlacement(state.prefillPlacementOwner);
+    cclScheduler::ReleaseExpertAlloc(state.prefillPlacementOwner);
+    return false;
+  }
+  PrepareExpertRoutesForPlacement(state.prefillPlacementOwner,
+                                  PipelineStage::PrefillAllToAll,
+                                  cclScheduler::PlacementKind::Prefill,
+                                  cfg);
+
+  auto decodeGpus = cclScheduler::TryPlaceNeed(
+      state.decodePlacementOwner,
+      cclScheduler::PlacementKind::Decode,
+      cfg.need_decode,
+      cfg.expert_num,
+      cfg.expert_mem_bytes,
+      cfg.expert_per_gpu);
+  if (decodeGpus.size() != cfg.need_decode) {
+    {
+      std::lock_guard<std::mutex> lk(g_mutex);
+      g_expert_route_cache.erase(state.prefillPlacementOwner);
+    }
+    cclScheduler::ReleasePlacement(state.prefillPlacementOwner);
+    cclScheduler::ReleaseExpertAlloc(state.prefillPlacementOwner);
+    return false;
+  }
+
+  auto decodeExpertMap = cclScheduler::AssignExperts(
+      state.decodePlacementOwner,
+      cfg.expert_num,
+      cfg.expert_mem_bytes,
+      cfg.expert_per_gpu,
+      decodeGpus);
+  if (!ExpertMapReady(decodeExpertMap, cfg.expert_num)) {
+    {
+      std::lock_guard<std::mutex> lk(g_mutex);
+      g_expert_route_cache.erase(state.prefillPlacementOwner);
+    }
+    cclScheduler::ReleasePlacement(state.prefillPlacementOwner);
+    cclScheduler::ReleaseExpertAlloc(state.prefillPlacementOwner);
+    cclScheduler::ReleasePlacement(state.decodePlacementOwner);
+    cclScheduler::ReleaseExpertAlloc(state.decodePlacementOwner);
+    return false;
+  }
+  PrepareExpertRoutesForPlacement(state.decodePlacementOwner,
+                                  PipelineStage::DecodeAllToAll,
+                                  cclScheduler::PlacementKind::Decode,
+                                  cfg);
+
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto it = g_pipeline_tasks.find(taskId);
+    if (it == g_pipeline_tasks.end()) {
+      g_expert_route_cache.erase(state.prefillPlacementOwner);
+      g_expert_route_cache.erase(state.decodePlacementOwner);
+      cclScheduler::ReleasePlacement(state.prefillPlacementOwner);
+      cclScheduler::ReleaseExpertAlloc(state.prefillPlacementOwner);
+      cclScheduler::ReleasePlacement(state.decodePlacementOwner);
+      cclScheduler::ReleaseExpertAlloc(state.decodePlacementOwner);
+      return false;
+    }
+    it->second.prefillGpus = prefillGpus;
+    it->second.decodeGpus = decodeGpus;
+    it->second.actualNeedPrefill = cfg.need_prefill;
+    it->second.actualNeedDecode = cfg.need_decode;
+    it->second.placementAttempted = true;
+  }
+  return true;
+}
+
+inline void RetryWaitingPipelineTasks() {
+  std::vector<uint32_t> taskIds;
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    for (const auto& kv : g_pipeline_tasks) {
+      const auto& state = kv.second;
+      if (!state.placementAttempted && state.prefillGpus.empty() && state.decodeGpus.empty())
+        taskIds.push_back(kv.first);
+    }
+  }
+
+  for (uint32_t taskId : taskIds) {
+    if (PreparePipelineTaskPlacement(taskId)) {
+      ccl::CclLog("mnCCL: pipeline task " + std::to_string(taskId) +
+                  " placement retry succeeded");
+      TryStartPipelineTask(taskId);
+    } else {
+      ccl::CclLog("mnCCL: pipeline task " + std::to_string(taskId) +
+                  " placement retry still waiting for resources");
+    }
+  }
 }
 
 inline const char* OpName(CollectiveOp op) {
@@ -940,19 +1241,11 @@ inline uint16_t SubmitAllToAll(uint32_t jobId,
         }
         if (candidates.empty())
           continue;
-        ExpertRoutePolicy routePolicy;
-        {
-          std::lock_guard<std::mutex> lk(g_mutex);
-          routePolicy = g_expert_route_policy ? g_expert_route_policy : RandomExpertRoutePolicy;
-        }
-        auto dstGpu = routePolicy(ExpertRouteRequest{
-            jobId,
+        auto dstGpu = ResolveCachedExpertRoute(
             placementOwner,
-            static_cast<uint32_t>(dstExpert),
-            stage,
-            pdKind,
             sourceGpu,
-            candidates});
+            static_cast<uint32_t>(dstExpert),
+            candidates);
         SubmitFlow(pg, sourceGpu, dstGpu, msgSize, keys, jobId, CollectiveOp::AllToAll, stage, pdKind);
       }
     }
@@ -1077,33 +1370,10 @@ inline void TryStartPipelineTask(uint32_t taskId) {
     state = it->second;
   }
 
-  auto cfg = GetRuntimeConfig();
-  uint32_t needPrefill = cfg.need_prefill;
-  auto gpus = cclScheduler::TryPlaceNeed(
-      state.prefillPlacementOwner,
-      cclScheduler::PlacementKind::Prefill,
-      needPrefill,
-      cfg.expert_num,
-      cfg.expert_mem_bytes);
-
-  if (gpus.size() != needPrefill) {
-    Simulator::Schedule(MicroSeconds(10), [taskId](){ TryStartPipelineTask(taskId); });
+  if (state.prefillGpus.empty()) {
     return;
   }
 
-  {
-    std::lock_guard<std::mutex> lk(g_mutex);
-    auto it = g_pipeline_tasks.find(taskId);
-    if (it == g_pipeline_tasks.end()) {
-      cclScheduler::ReleasePlacement(state.prefillPlacementOwner);
-      return;
-    }
-    it->second.actualNeedPrefill = needPrefill;
-    it->second.prefillGpus = gpus;
-    state = it->second;
-  }
-
-  cclScheduler::AssignExperts(state.prefillPlacementOwner, cfg.expert_num, gpus);
   StartPrefillAllReduce(state);
 }
 
@@ -1117,11 +1387,11 @@ inline void StartPrefillAllReduce(PipelineTaskState& state) {
     it->second.prefillAllReduceJobId = jobId;
     g_pipeline_stage_by_job[jobId] = PipelineStageRef{state.task.taskId, PipelineStage::PrefillAllReduce};
   }
-  auto cfg = GetRuntimeConfig();
+  auto cfg = TaskRuntimeConfig(state);
   SubmitAllReduceForStage(jobId,
                           cfg.pg,
                           state.prefillGpus,
-                          PrefillAllReduceMsgSize(state.task),
+                          PrefillAllReduceMsgSize(state.task, cfg),
                           false,
                           true,
                           true,
@@ -1139,11 +1409,11 @@ inline void StartPrefillAllToAll(PipelineTaskState& state) {
     it->second.prefillAllToAllJobId = jobId;
     g_pipeline_stage_by_job[jobId] = PipelineStageRef{state.task.taskId, PipelineStage::PrefillAllToAll};
   }
-  auto cfg = GetRuntimeConfig();
+  auto cfg = TaskRuntimeConfig(state);
   SubmitAllToAll(jobId,
                  cfg.pg,
                  state.prefillGpus,
-                 PrefillAllToAllMsgSize(state.task),
+                 PrefillAllToAllMsgSize(state.task, cfg),
                  cfg.k,
                  cfg.expert_num,
                  cfg.expert_mem_bytes,
@@ -1183,40 +1453,10 @@ inline void TryStartDecode(uint32_t taskId) {
     return;
   }
 
-  if (!state.decodeGpus.empty()) {
-    StartKvCacheTransfer(state);
+  if (state.decodeGpus.empty()) {
     return;
   }
 
-  auto cfg = GetRuntimeConfig();
-  uint32_t needDecode = cfg.need_decode;
-  auto gpus = cclScheduler::TryPlaceNeed(
-      state.decodePlacementOwner,
-      cclScheduler::PlacementKind::Decode,
-      needDecode,
-      cfg.expert_num,
-      cfg.expert_mem_bytes);
-
-  if (gpus.size() != needDecode) {
-    Simulator::Schedule(MicroSeconds(10), [taskId](){ TryStartDecode(taskId); });
-    return;
-  }
-
-  {
-    std::lock_guard<std::mutex> lk(g_mutex);
-    auto it = g_pipeline_tasks.find(taskId);
-    if (it == g_pipeline_tasks.end()) {
-      cclScheduler::ReleasePlacement(state.decodePlacementOwner);
-      return;
-    }
-    it->second.actualNeedDecode = needDecode;
-    it->second.decodeGpus = gpus;
-    if (it->second.decodeStartNs == 0)
-      it->second.decodeStartNs = Simulator::Now().GetNanoSeconds();
-    state = it->second;
-  }
-
-  cclScheduler::AssignExperts(state.decodePlacementOwner, cfg.expert_num, gpus);
   StartKvCacheTransfer(state);
 }
 
@@ -1230,15 +1470,15 @@ inline void StartKvCacheTransfer(PipelineTaskState& state) {
     it->second.kvCacheJobId = jobId;
     g_pipeline_stage_by_job[jobId] = PipelineStageRef{state.task.taskId, PipelineStage::KvCacheTransfer};
   }
-  auto cfg = GetRuntimeConfig();
-  SubmitKvCacheTransfer(jobId, cfg.pg, state.prefillGpus, state.decodeGpus, KvCacheMsgSize(state.task));
+  auto cfg = TaskRuntimeConfig(state);
+  SubmitKvCacheTransfer(jobId, cfg.pg, state.prefillGpus, state.decodeGpus, KvCacheMsgSize(state.task, cfg));
 }
 
 inline uint64_t DecodeComputeDelayNs(const PipelineTaskState& state) {
   const auto& activeGpus = ActiveDecodeGpus(state);
   uint64_t avgRemaining = cclScheduler::GetAverageRemainingMemory(activeGpus);
   uint64_t avgCapacity = cclScheduler::GetAverageCapacity(activeGpus);
-  auto cfg = GetRuntimeConfig();
+  auto cfg = TaskRuntimeConfig(state);
   if (avgCapacity == 0)
     return cfg.base_decode_compute_delay_ns;
   double pressure = 1.0 - static_cast<double>(avgRemaining) / static_cast<double>(avgCapacity);
@@ -1317,7 +1557,7 @@ inline void StartNextDecodeToken(uint32_t taskId) {
 
 inline void StartDecodeAllReduce(PipelineTaskState& state) {
   uint32_t jobId = JID++;
-  auto cfg = GetRuntimeConfig();
+  auto cfg = TaskRuntimeConfig(state);
   const auto& activeGpus = ActiveDecodeGpus(state);
   auto activeKind = ActiveDecodePlacementKind(state);
   {
@@ -1341,7 +1581,7 @@ inline void StartDecodeAllReduce(PipelineTaskState& state) {
 
 inline void StartDecodeAllToAll(PipelineTaskState& state) {
   uint32_t jobId = JID++;
-  auto cfg = GetRuntimeConfig();
+  auto cfg = TaskRuntimeConfig(state);
   const auto& activeGpus = ActiveDecodeGpus(state);
   uint32_t activePlacementOwner = ActiveDecodePlacementOwner(state);
   auto activeKind = ActiveDecodePlacementKind(state);
@@ -1392,15 +1632,22 @@ inline void FinishPipelineTask(uint32_t taskId) {
     cclScheduler::ReleasePlacement(state.decodePlacementOwner);
     cclScheduler::ReleaseExpertAlloc(state.decodePlacementOwner);
   }
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_expert_route_cache.erase(state.prefillPlacementOwner);
+    g_expert_route_cache.erase(state.decodePlacementOwner);
+  }
 
-  auto finishCfg = RefreshRuntimeConfig(cclScheduler::NeedEvent::TaskFinish, state.task);
-  LogPipelineTaskSummary(state, nowNs, finishCfg, true);
+  auto taskCfg = TaskRuntimeConfig(state);
+  LogPipelineTaskSummary(state, nowNs, taskCfg, true, true);
+  RetryWaitingPipelineTasks();
 }
 
 inline void LogPipelineTaskSummary(const PipelineTaskState& state,
                                    uint64_t nowNs,
                                    const RuntimeConfig& cfg,
-                                   bool completed) {
+                                   bool completed,
+                                   bool accumulateStats) {
   uint64_t startNs = state.startTimeNs;
   uint64_t totalFctNs = nowNs >= startNs ? nowNs - startNs : 0;
   uint64_t decodeE2eNs = (state.decodeStartNs > 0 && nowNs >= state.decodeStartNs)
@@ -1417,6 +1664,13 @@ inline void LogPipelineTaskSummary(const PipelineTaskState& state,
       uint64_t tpotDenominator = completed ? state.decodeIterations - 1 : completedDecodeTokens - 1;
       tpotNs = (tpotEndNs - state.firstTokenFinishNs) / tpotDenominator;
     }
+  }
+
+  if (completed && accumulateStats) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_pipeline_latency_stats.completedTasks++;
+    g_pipeline_latency_stats.sumTtftNs += ttftNs;
+    g_pipeline_latency_stats.sumTpotNs += tpotNs;
   }
 
   uint64_t prefillCollectiveMsgSize =
@@ -1454,9 +1708,10 @@ inline void LogPipelineTaskSummary(const PipelineTaskState& state,
      << "    prefill_side_decode_iterations=" << state.prefillSideDecodeIterations << "\n"
      << "    need_prefill=" << state.actualNeedPrefill << "\n"
      << "    need_decode=" << state.actualNeedDecode << "\n"
-     << "    current_need_prefill=" << cfg.need_prefill << "\n"
-     << "    current_need_decode=" << cfg.need_decode << "\n"
+     << "    dispatch_need_prefill=" << cfg.need_prefill << "\n"
+     << "    dispatch_need_decode=" << cfg.need_decode << "\n"
      << "    expert_num=" << cfg.expert_num << "\n"
+     << "    expert_per_gpu=" << cfg.expert_per_gpu << "\n"
      << "  comm:\n"
      << "    single_token_length=" << cfg.single_token_length << "\n"
      << "    bytes_per_token=" << cfg.token_msg_size << "\n"
@@ -1479,19 +1734,28 @@ inline void LogPipelineTaskSummary(const PipelineTaskState& state,
 inline void LogPipelineSummariesAtSimulationEnd() {
   std::vector<PipelineTaskState> activeTasks;
   std::vector<std::pair<uint32_t, PipelineStageRef>> outstandingStageRefs;
-  RuntimeConfig cfg = GetRuntimeConfig();
+  std::vector<std::pair<uint64_t, uint64_t>> localQueueSizes;
+  std::vector<std::pair<uint64_t, bool>> localActiveStates;
   uint64_t nowNs = Simulator::Now().GetNanoSeconds();
   uint32_t outstandingJobs = 0;
   uint64_t queuedFlows = 0;
+  PipelineLatencyStats latencyStats{};
   {
     std::lock_guard<std::mutex> lk(g_mutex);
     for (const auto& kv : g_pipeline_tasks)
       activeTasks.push_back(kv.second);
     outstandingJobs = static_cast<uint32_t>(g_outstanding.size());
-    for (const auto& kv : g_local_flow_queues)
+    for (const auto& kv : g_local_flow_queues) {
       queuedFlows += kv.second.size();
+      if (!kv.second.empty())
+        localQueueSizes.emplace_back(kv.first, static_cast<uint64_t>(kv.second.size()));
+    }
+    for (const auto& kv : g_local_flow_active)
+      if (kv.second)
+        localActiveStates.emplace_back(kv.first, kv.second);
     for (const auto& kv : g_pipeline_stage_by_job)
       outstandingStageRefs.push_back(kv);
+    latencyStats = g_pipeline_latency_stats;
   }
 
   {
@@ -1520,8 +1784,35 @@ inline void LogPipelineSummariesAtSimulationEnd() {
     ccl::CclLog(ss.str());
   }
 
+  for (const auto& kv : localQueueSizes) {
+    std::ostringstream ss;
+    ss << "mnCCL: queued local GPU key=" << kv.first
+       << " queued_flows=" << kv.second;
+    ccl::CclLog(ss.str());
+  }
+  for (const auto& kv : localActiveStates) {
+    std::ostringstream ss;
+    ss << "mnCCL: active local GPU key=" << kv.first;
+    ccl::CclLog(ss.str());
+  }
+
   for (const auto& state : activeTasks)
-    LogPipelineTaskSummary(state, nowNs, cfg, false);
+    LogPipelineTaskSummary(state, nowNs, TaskRuntimeConfig(state), false, false);
+
+  {
+    uint64_t avgTtftNs = latencyStats.completedTasks == 0
+                         ? 0
+                         : latencyStats.sumTtftNs / latencyStats.completedTasks;
+    uint64_t avgTpotNs = latencyStats.completedTasks == 0
+                         ? 0
+                         : latencyStats.sumTpotNs / latencyStats.completedTasks;
+    std::ostringstream ss;
+    ss << "mnCCL: completed task latency average\n"
+       << "  completed_tasks=" << latencyStats.completedTasks << "\n"
+       << "  average_TTFT_ns=" << avgTtftNs << "\n"
+       << "  average_TPOT_ns=" << avgTpotNs;
+    ccl::CclLog(ss.str());
+  }
 }
 
 inline void OnCollectiveFinished(uint32_t jobId) {

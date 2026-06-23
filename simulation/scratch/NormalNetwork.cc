@@ -11,6 +11,7 @@
 #include "mnCCL.h"
 #include "cclscheduler.h"
 #include "task_generator.h"
+#include "pipeline_policy_config.h"
 #include "ns3/applications-module.h"
 #include "ns3/core-module.h"
 #include "ns3/csma-module.h"
@@ -87,16 +88,29 @@ int main(int argc, char* argv[]) {
 #endif
 
   float comm_scale = 1;
+  std::string network_config_file = "./examples/HW/test.sh";
+  std::string policy_config_file = "./scratch/pipeline_policy.conf";
 
   CommandLine cmd;
   cmd.AddValue("commscale", "Communication Scale", comm_scale);
+  cmd.AddValue("networkConfig", "Network topology/config file consumed by ReadConf", network_config_file);
+  cmd.AddValue("policyConfig", "Pipeline scheduling policy config file", policy_config_file);
   cmd.Parse(argc, argv);
 
   clock_t begint, endt;
   begint = clock();
 
-  if (!ReadConf(argc, argv))
+  if (!network_config_file.empty()) {
+    std::vector<std::string> conf_args = {argv[0], network_config_file};
+    std::vector<char*> conf_argv;
+    conf_argv.reserve(conf_args.size());
+    for (auto& arg : conf_args)
+      conf_argv.push_back(arg.data());
+    if (!ReadConf(static_cast<int>(conf_argv.size()), conf_argv.data()))
+      return -1;
+  } else if (!ReadConf(1, argv)) {
     return -1;
+  }
   SetConfig();
   SetupNetwork(qp_finish_normal, send_finish_normal, message_finish_normal);
 
@@ -119,6 +133,7 @@ int main(int argc, char* argv[]) {
   }
 
   auto workload_params = taskGenerator::DefaultPipelineWorkloadParams();
+  workload_params = pipelinePolicy::ApplyPolicyConfigFile(workload_params, policy_config_file);
   taskGenerator::RegisterPipelineWorkload(workload_params);
 
   Simulator::Stop(Seconds(workload_params.simulation_stop_time));

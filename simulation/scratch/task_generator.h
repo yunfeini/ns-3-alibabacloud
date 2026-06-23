@@ -18,7 +18,8 @@ struct PipelineRuntimeParams {
   uint32_t need_prefill = 128;
   uint32_t need_decode = 32;
   uint32_t expert_num = 64;
-  uint32_t kflows = 4;
+  uint32_t expert_per_gpu = 1;
+  uint32_t kflows = 2;
   uint32_t single_token_length = 2;
   uint64_t expert_mem_bytes = 64ULL * 1024ULL * 1024ULL;
   uint64_t token_msg_size = 2;
@@ -26,14 +27,14 @@ struct PipelineRuntimeParams {
 };
 
 struct PipelineTaskDistributionParams {
-  uint32_t num_tasks = 10;
+  uint32_t num_tasks = 3;
   uint32_t seed = 12345;
   uint32_t prefill_length_min = 8192;
   uint32_t prefill_length_max = 16384;
   uint32_t decode_length_min = 256;
   uint32_t decode_length_max = 2048;
   double first_submit_time = 0.00001;
-  double submit_interval = 0.0001;
+  double submit_interval = 0.00001;
 };
 
 struct PipelineWorkloadParams {
@@ -80,6 +81,7 @@ inline mnccl::RuntimeConfig MakeRuntimeConfig(const PipelineRuntimeParams& param
       params.need_prefill,
       params.need_decode,
       params.expert_num,
+      params.expert_per_gpu,
       params.kflows,
       params.single_token_length,
       params.expert_mem_bytes,
@@ -123,7 +125,7 @@ inline void SubmitPipelineTasks(const std::vector<mnccl::PipelineTask>& tasks,
       *output << "NormalNetwork: scheduled task " << task.taskId
               << " prefill_length=" << task.prefillLength
               << " decode_length=" << task.decodeLength
-              << " at " << task.submitTime << "s\n";
+              << " at " << task.submitTime << "s" << std::endl;
     }
   }
 }
@@ -133,7 +135,9 @@ inline PipelineWorkloadParams DefaultPipelineWorkloadParams() {
 }
 
 inline void RegisterPipelineWorkload(const PipelineWorkloadParams& params) {
+  ccl::CclLog("PipelinePolicy: register workload start");
   ConfigurePipelineRuntime(params.runtime);
+  ccl::CclLog("PipelinePolicy: dispatch hooks install start");
   cclScheduler::SetNeedUpdateCallback(
       params.need_update_callback ? params.need_update_callback : DefaultNeedUpdateCallback());
   cclScheduler::SetNeedPlacementPolicy(params.need_placement_policy);
@@ -141,8 +145,12 @@ inline void RegisterPipelineWorkload(const PipelineWorkloadParams& params) {
   mnccl::SetLocalFlowSchedulePolicy(params.local_flow_schedule_policy);
   mnccl::SetExpertRoutePolicy(params.expert_route_policy);
   mnccl::SetPdSplitPolicy(params.pd_split_policy);
+  ccl::CclLog("PipelinePolicy: dispatch hooks install done");
   auto tasks = GenerateCurrentPipelineTaskDistribution(params.distribution);
+  ccl::CclLog("PipelinePolicy: task generation start num_tasks=" +
+              std::to_string(tasks.size()));
   SubmitPipelineTasks(tasks, params.print_submissions, params.output);
+  ccl::CclLog("PipelinePolicy: task generation and dispatch done");
 }
 
 } // namespace taskGenerator
