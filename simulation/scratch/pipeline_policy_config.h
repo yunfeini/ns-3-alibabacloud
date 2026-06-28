@@ -48,6 +48,7 @@ struct PolicyConfig {
   uint32_t min_need = 1;
   uint32_t max_need = 0;
   uint32_t expert_per_gpu = 1;
+  uint64_t cluster_monitor_interval_ns = 1000000;
   std::string need_placement_policy = "expert_capacity_l1";
   std::string expert_placement_policy = "l1_minmax_frequency";
   std::string same_rank_route_policy = "probe_rtt_delta";
@@ -187,6 +188,8 @@ inline PolicyConfig LoadPolicyConfig(const std::string& path) {
       cfg.max_need = static_cast<uint32_t>(std::stoul(value));
     else if (key == "EXPERT_PER_GPU")
       cfg.expert_per_gpu = static_cast<uint32_t>(std::stoul(value));
+    else if (key == "CLUSTER_MONITOR_INTERVAL_NS")
+      cfg.cluster_monitor_interval_ns = std::stoull(value);
     else if (key == "NEED_PLACEMENT_POLICY")
       cfg.need_placement_policy = value;
     else if (key == "EXPERT_PLACEMENT_POLICY")
@@ -420,6 +423,159 @@ inline std::vector<std::vector<std::pair<uint32_t,uint32_t>>> BuildExpertPlan(
   return plan;
 }
 
+inline std::vector<std::vector<std::pair<uint32_t,uint32_t>>> BuildDomainBalancedExternalMinPlan(
+    uint32_t expertNum,
+    uint32_t expertPerGpu,
+    const std::vector<std::pair<uint32_t,uint32_t>>& gpus,
+    ExpertPlanScore* scoreOut = nullptr) {
+  std::vector<std::vector<std::pair<uint32_t,uint32_t>>> plan(expertNum);
+  if (gpus.empty() || expertNum == 0)
+    return plan;
+
+  uint32_t expertsPerGpu = ExpertsOnGpu(
+      expertNum, static_cast<uint32_t>(gpus.size()), 0, expertPerGpu);
+  if (expertsPerGpu == 0)
+    return plan;
+  expertsPerGpu = std::min(expertsPerGpu, expertNum);
+  uint32_t totalSlots = expertsPerGpu * static_cast<uint32_t>(gpus.size());
+  if (totalSlots < expertNum)
+    return plan;
+
+  std::map<std::pair<uint32_t,uint32_t>, uint32_t> expertsOnGpu;
+  std::map<std::pair<uint32_t,uint32_t>, std::set<uint32_t>> expertsAssignedOnGpu;
+  std::map<uint32_t, std::vector<std::pair<uint32_t,uint32_t>>> gpusByL1;
+  std::map<uint32_t, double> l1Load;
+  std::map<uint32_t, std::set<uint32_t>> expertsByL1;
+  for (const auto& gpu : gpus) {
+    uint32_t l1 = L1GroupOfGpu(gpu);
+    gpusByL1[l1].push_back(gpu);
+    l1Load[l1] += 0.0;
+  }
+
+  std::vector<uint32_t> expertsByFreq(expertNum);
+  std::iota(expertsByFreq.begin(), expertsByFreq.end(), 0);
+  std::sort(expertsByFreq.begin(), expertsByFreq.end(), [](uint32_t a, uint32_t b) {
+    if (ExpertFreq(a) != ExpertFreq(b))
+      return ExpertFreq(a) > ExpertFreq(b);
+    return a < b;
+  });
+
+  auto bestGpuInL1 = [&](uint32_t l1, uint32_t expert) {
+    bool found = false;
+    std::pair<uint32_t,uint32_t> bestGpu = gpus.front();
+    uint32_t bestCount = std::numeric_limits<uint32_t>::max();
+    for (const auto& gpu : gpusByL1[l1]) {
+      if (expertsOnGpu[gpu] >= expertsPerGpu)
+        continue;
+      if (expertsAssignedOnGpu[gpu].count(expert) != 0)
+        continue;
+      uint32_t count = expertsOnGpu[gpu];
+      if (!found || count < bestCount || (count == bestCount && gpu < bestGpu)) {
+        found = true;
+        bestCount = count;
+        bestGpu = gpu;
+      }
+    }
+    return std::make_pair(found, bestGpu);
+  };
+
+  auto placeExpert = [&](uint32_t expert, uint32_t l1) {
+    auto chosen = bestGpuInL1(l1, expert);
+    if (!chosen.first)
+      return false;
+    const auto& gpu = chosen.second;
+    plan[expert].push_back(gpu);
+    expertsAssignedOnGpu[gpu].insert(expert);
+    expertsOnGpu[gpu]++;
+    l1Load[l1] += ExpertFreq(expert);
+    expertsByL1[l1].insert(expert);
+    return true;
+  };
+
+  for (uint32_t expert : expertsByFreq) {
+    bool found = false;
+    uint32_t bestL1 = gpusByL1.begin()->first;
+    ExpertPlanScore bestScore;
+    for (const auto& kv : gpusByL1) {
+      uint32_t l1 = kv.first;
+      if (!bestGpuInL1(l1, expert).first)
+        continue;
+      std::map<uint32_t, double> trialLoad = l1Load;
+      trialLoad[l1] += ExpertFreq(expert);
+      ExpertPlanScore trial{
+          MaxL1Load(trialLoad),
+          L1LoadVariance(trialLoad),
+          static_cast<double>(expertsByL1[l1].count(expert) == 0 ? 0 : 1)};
+      if (!found || BetterPlanScore(trial, bestScore)) {
+        found = true;
+        bestScore = trial;
+        bestL1 = l1;
+      }
+    }
+    if (!found || !placeExpert(expert, bestL1))
+      return std::vector<std::vector<std::pair<uint32_t,uint32_t>>>(expertNum);
+  }
+
+  uint32_t placed = expertNum;
+  while (placed < totalSlots) {
+    bool found = false;
+    uint32_t bestExpert = 0;
+    uint32_t bestL1 = gpusByL1.begin()->first;
+    std::tuple<double, double, double, uint32_t, uint32_t> bestScore{
+        std::numeric_limits<double>::max(),
+        std::numeric_limits<double>::max(),
+        std::numeric_limits<double>::max(),
+        std::numeric_limits<uint32_t>::max(),
+        std::numeric_limits<uint32_t>::max()};
+
+    for (uint32_t expert : expertsByFreq) {
+      double freq = ExpertFreq(expert);
+      for (const auto& kv : gpusByL1) {
+        uint32_t l1 = kv.first;
+        if (expertsByL1[l1].count(expert) != 0)
+          continue;
+        if (!bestGpuInL1(l1, expert).first)
+          continue;
+        std::map<uint32_t, double> trialLoad = l1Load;
+        trialLoad[l1] += freq;
+        double domainsMissingExpert = 0.0;
+        for (const auto& domain : gpusByL1) {
+          if (domain.first != l1 && expertsByL1[domain.first].count(expert) == 0)
+            domainsMissingExpert += 1.0;
+        }
+        double replicaCount = static_cast<double>(std::max<size_t>(1, plan[expert].size()));
+        double marginalGain = freq / replicaCount;
+        double externalCostAfter = domainsMissingExpert * freq;
+        double replicaPenalty = replicaCount * replicaCount * 0.05;
+        auto score = std::make_tuple(
+            externalCostAfter * 0.01 - marginalGain + replicaPenalty,
+            L1LoadVariance(trialLoad),
+            MaxL1Load(trialLoad),
+            static_cast<uint32_t>(plan[expert].size()),
+            expert);
+        if (!found || score < bestScore) {
+          found = true;
+          bestScore = score;
+          bestExpert = expert;
+          bestL1 = l1;
+        }
+      }
+    }
+
+    if (!found || !placeExpert(bestExpert, bestL1))
+      break;
+    placed++;
+  }
+
+  if (scoreOut != nullptr) {
+    *scoreOut = ExpertPlanScore{
+        MaxL1Load(l1Load),
+        L1LoadVariance(l1Load),
+        TopologyDistanceScore(gpus)};
+  }
+  return plan;
+}
+
 inline uint32_t MaxExpertsPerGpu() {
   return 9;
 }
@@ -588,7 +744,11 @@ inline cclScheduler::ExpertPlacementPolicy ExpertPlacementPolicy() {
       ccl::CclLog(ss.str());
     }
     ExpertPlanScore score;
-    auto plan = BuildExpertPlan(req.expert_num, req.expert_per_gpu, req.gpus, &score);
+    std::string policy = Lower(Trim(State().config.expert_placement_policy));
+    auto plan = policy == "domain_balanced_external_min"
+                ? BuildDomainBalancedExternalMinPlan(
+                      req.expert_num, req.expert_per_gpu, req.gpus, &score)
+                : BuildExpertPlan(req.expert_num, req.expert_per_gpu, req.gpus, &score);
     State().latest_expert_plan = plan;
     State().latest_plan_max_l1_load = score.maxL1Load;
     State().latest_plan_l1_variance = score.l1Variance;
@@ -597,6 +757,7 @@ inline cclScheduler::ExpertPlacementPolicy ExpertPlacementPolicy() {
       ss << "PipelinePolicy: expert placement dispatch"
          << " owner=" << req.ownerId
          << " kind=" << cclScheduler::PlacementKindName(req.kind)
+         << " policy=" << State().config.expert_placement_policy
          << " experts=" << plan.size()
          << " l1_max_load=" << score.maxL1Load
          << " l1_variance=" << score.l1Variance;

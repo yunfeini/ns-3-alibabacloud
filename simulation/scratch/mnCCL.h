@@ -51,6 +51,9 @@ static PipelineLatencyStats g_pipeline_latency_stats;
 static std::mutex g_mutex;
 // Path to write flow completion records.
 static std::string g_flow_finish_log_path;
+static std::string g_cluster_monitor_log_path;
+static uint64_t g_cluster_monitor_interval_ns = 1000000;
+static bool g_cluster_monitor_enabled = false;
 
 struct CollectiveJob {
   uint32_t jobId;
@@ -192,6 +195,9 @@ inline void LogPipelineTaskSummary(const PipelineTaskState& state,
                                    bool completed,
                                    bool accumulateStats);
 inline void LogPipelineSummariesAtSimulationEnd();
+inline void SetClusterMonitorLogPath(const std::string& path);
+inline void StartClusterTimeSeriesMonitor(uint64_t intervalNs);
+inline void SampleClusterTimeSeries();
 inline uint64_t DecodeComputeDelayNs(const PipelineTaskState& state);
 inline bool ExpertMapReady(
     const std::vector<std::vector<std::pair<uint32_t,uint32_t>>>& expertMap,
@@ -311,6 +317,21 @@ inline bool OnMessageFinish(FILE* fout, Ptr<RdmaQueuePair> q, uint64_t msgSize);
 inline void SetFlowFinishLogPath(const std::string &path) {
   std::lock_guard<std::mutex> lk(g_mutex);
   g_flow_finish_log_path = path;
+}
+
+inline void SetClusterMonitorLogPath(const std::string& path) {
+  std::lock_guard<std::mutex> lk(g_mutex);
+  g_cluster_monitor_log_path = path;
+}
+
+inline void StartClusterTimeSeriesMonitor(uint64_t intervalNs) {
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_cluster_monitor_interval_ns = std::max<uint64_t>(1, intervalNs);
+    g_cluster_monitor_enabled = !g_cluster_monitor_log_path.empty();
+  }
+  if (g_cluster_monitor_enabled)
+    Simulator::ScheduleNow(&SampleClusterTimeSeries);
 }
 
 std::vector<std::pair<uint32_t,uint32_t>> participants;
@@ -1813,6 +1834,110 @@ inline void LogPipelineSummariesAtSimulationEnd() {
        << "  average_TPOT_ns=" << avgTpotNs;
     ccl::CclLog(ss.str());
   }
+}
+
+inline void SampleClusterTimeSeries() {
+  std::string path;
+  uint64_t intervalNs = 0;
+  uint64_t activeTasks = 0;
+  uint64_t outstandingJobs = 0;
+  uint64_t queuedFlows = 0;
+  uint64_t activeLocalGpus = 0;
+  uint64_t expertMemBytes = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!g_cluster_monitor_enabled || g_cluster_monitor_log_path.empty())
+      return;
+    path = g_cluster_monitor_log_path;
+    intervalNs = g_cluster_monitor_interval_ns;
+    activeTasks = g_pipeline_tasks.size();
+    outstandingJobs = g_outstanding.size();
+    expertMemBytes = g_runtime_config.expert_mem_bytes;
+    for (const auto& kv : g_local_flow_queues)
+      queuedFlows += kv.second.size();
+    for (const auto& kv : g_local_flow_active)
+      if (kv.second)
+        activeLocalGpus++;
+  }
+
+  std::vector<std::vector<uint32_t>> expertSlots;
+  uint32_t numNodes = 0;
+  uint32_t gpusPerServer = 0;
+  uint32_t maxExpertsPerGpu = 0;
+  cclScheduler::GetActiveExpertSlotSnapshot(
+      expertSlots, numNodes, gpusPerServer, maxExpertsPerGpu);
+
+  uint64_t totalGpus = 0;
+  uint64_t usedGpus = 0;
+  uint64_t totalExpertSlots = 0;
+  uint64_t usedExpertSlots = 0;
+  uint64_t freeExpertSlots = 0;
+  uint64_t maxFreeExpertSlots = 0;
+  uint64_t sumFreeSq = 0;
+  uint64_t totalGpuMemBytes = 0;
+  uint64_t usedGpuMemBytes = 0;
+  for (uint32_t node = 0; node < numNodes; ++node) {
+    for (uint32_t gpu = 0; gpu < gpusPerServer; ++gpu) {
+      uint64_t used = 0;
+      if (node < expertSlots.size() && gpu < expertSlots[node].size())
+        used = expertSlots[node][gpu];
+      uint64_t capacity = maxExpertsPerGpu;
+      uint64_t cappedUsed = std::min(used, capacity);
+      uint64_t freeSlots = capacity > cappedUsed ? capacity - cappedUsed : 0;
+      uint64_t gpuMemBytes = capacity * expertMemBytes;
+      totalGpus++;
+      totalExpertSlots += capacity;
+      usedExpertSlots += cappedUsed;
+      freeExpertSlots += freeSlots;
+      maxFreeExpertSlots = std::max(maxFreeExpertSlots, freeSlots);
+      sumFreeSq += freeSlots * freeSlots;
+      totalGpuMemBytes += gpuMemBytes;
+      usedGpuMemBytes += cappedUsed * expertMemBytes;
+      if (used > 0)
+        usedGpus++;
+    }
+  }
+
+  double placementGpuUtilization = totalGpus == 0 ? 0.0 : static_cast<double>(usedGpus) / totalGpus;
+  double gpuUtilization = totalGpuMemBytes == 0
+                          ? 0.0
+                          : static_cast<double>(usedGpuMemBytes) / totalGpuMemBytes;
+  double expertSlotUtilization = totalExpertSlots == 0
+                                 ? 0.0
+                                 : static_cast<double>(usedExpertSlots) / totalExpertSlots;
+  double fragmentation = (freeExpertSlots == 0 || usedExpertSlots == 0)
+                         ? 0.0
+                         : 1.0 - static_cast<double>(maxFreeExpertSlots) / freeExpertSlots;
+  double freeSlotVariance = 0.0;
+  if (totalGpus > 0) {
+    double meanFree = static_cast<double>(freeExpertSlots) / totalGpus;
+    freeSlotVariance = static_cast<double>(sumFreeSq) / totalGpus - meanFree * meanFree;
+  }
+
+  std::ofstream ofs(path, std::ofstream::app);
+  if (ofs) {
+    ofs << Simulator::Now().GetNanoSeconds() << ","
+        << activeTasks << ","
+        << outstandingJobs << ","
+        << queuedFlows << ","
+        << activeLocalGpus << ","
+        << totalGpus << ","
+        << usedGpus << ","
+        << totalExpertSlots << ","
+        << usedExpertSlots << ","
+        << freeExpertSlots << ","
+        << maxFreeExpertSlots << ","
+        << gpuUtilization << ","
+        << expertSlotUtilization << ","
+        << fragmentation << ","
+        << freeSlotVariance << ","
+        << placementGpuUtilization << ","
+        << usedGpuMemBytes << ","
+        << totalGpuMemBytes << "\n";
+    ofs.flush();
+  }
+
+  Simulator::Schedule(NanoSeconds(intervalNs), &SampleClusterTimeSeries);
 }
 
 inline void OnCollectiveFinished(uint32_t jobId) {

@@ -531,6 +531,17 @@ inline std::vector<std::pair<uint32_t, uint32_t>> FillNeedPlacementPolicy(
     bool placed = false;
     for (uint32_t node = 0; node < num_nodes && !placed; node++) {
       for (uint32_t g = 0; g < gpus_per_server && !placed; g++) {
+        uint64_t linear = static_cast<uint64_t>(node) * gpus_per_server + g;
+        uint64_t total = static_cast<uint64_t>(num_nodes) * gpus_per_server;
+        uint64_t split = (total * 3) / 4;
+        if (split == 0)
+          split = 1;
+        if (split >= total && total > 1)
+          split = total - 1;
+        if (req.kind == PlacementKind::Prefill && linear >= split)
+          continue;
+        if (req.kind == PlacementKind::Decode && linear < split)
+          continue;
         uint32_t idx = static_cast<uint32_t>(res.size());
         uint32_t experts = ExpertsOnGpuIndex(
             req.expert_num, req.need, idx, req.expert_mem_bytes, req.expert_per_gpu);
@@ -728,6 +739,25 @@ inline void GetResourceSnapshot(std::vector<std::vector<uint64_t>>& mem_used,
   num_nodes = s_num_nodes;
   gpus_per_server = s_gpus_per_server;
   max_experts_per_gpu = kMaxExpertsPerGpu;
+}
+
+inline void GetActiveExpertSlotSnapshot(std::vector<std::vector<uint32_t>>& expert_slots,
+                                        uint32_t& num_nodes,
+                                        uint32_t& gpus_per_server,
+                                        uint32_t& max_experts_per_gpu) {
+  std::lock_guard<std::mutex> lk(s_mutex);
+  num_nodes = s_num_nodes;
+  gpus_per_server = s_gpus_per_server;
+  max_experts_per_gpu = kMaxExpertsPerGpu;
+  expert_slots.assign(s_num_nodes, std::vector<uint32_t>(s_gpus_per_server, 0));
+  for (const auto& owner : s_expert_alloc) {
+    for (const auto& replicas : owner.second) {
+      for (const auto& gpu : replicas) {
+        if (gpu.first < s_num_nodes && gpu.second < s_gpus_per_server)
+          expert_slots[gpu.first][gpu.second] += 1;
+      }
+    }
+  }
 }
 
 //check if there are enough free GPUs for a new job

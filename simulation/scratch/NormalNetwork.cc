@@ -121,7 +121,9 @@ int main(int argc, char* argv[]) {
 
   const std::string mncc_log = "mncc.log";
   const std::string mncc_flow_finish_log = "mncc_flow_finish.csv";
+  const std::string mncc_cluster_timeseries_log = "mncc_cluster_timeseries.csv";
   mnccl::SetFlowFinishLogPath(mncc_flow_finish_log);
+  mnccl::SetClusterMonitorLogPath(mncc_cluster_timeseries_log);
   ccl::SetCclLogPath(mncc_log);
   {
     std::ofstream ofs(mncc_log, std::ofstream::trunc);
@@ -131,10 +133,21 @@ int main(int argc, char* argv[]) {
     ofs << "finish_time_ns,jobId,srcNode,dstNode,pg,sport,dport,msg_size,"
         << "qp_start_time_step,actual_fct,standalone_fct\n";
   }
+  {
+    std::ofstream ofs(mncc_cluster_timeseries_log, std::ofstream::trunc);
+    ofs << "time_ns,active_tasks,outstanding_collectives,queued_local_flows,"
+        << "active_local_gpus,total_gpus,used_gpus,total_expert_slots,"
+        << "used_expert_slots,free_expert_slots,max_free_expert_slots,"
+        << "gpu_utilization,expert_slot_utilization,expert_fragmentation,"
+        << "free_slot_variance,placement_gpu_utilization,used_gpu_mem_bytes,"
+        << "total_gpu_mem_bytes\n";
+  }
 
   auto workload_params = taskGenerator::DefaultPipelineWorkloadParams();
-  workload_params = pipelinePolicy::ApplyPolicyConfigFile(workload_params, policy_config_file);
+  auto policy_cfg = pipelinePolicy::LoadPolicyConfig(policy_config_file);
+  workload_params = pipelinePolicy::ApplyPolicyConfig(workload_params, policy_cfg);
   taskGenerator::RegisterPipelineWorkload(workload_params);
+  mnccl::StartClusterTimeSeriesMonitor(policy_cfg.cluster_monitor_interval_ns);
 
   Simulator::Stop(Seconds(workload_params.simulation_stop_time));
   printf("Simulation Start.\n");
