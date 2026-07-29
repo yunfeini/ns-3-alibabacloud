@@ -25,6 +25,10 @@ simulation/.waf*-*
 simulation/cmake-cache/*
 simulation/cmake-cache/*
 simulation/.lock-ns3_linux_build
+simulation/results/
+simulation/examples/HW/outputs/
+simulation.tar.gz
+.vscode/
 
 analysis/*
 

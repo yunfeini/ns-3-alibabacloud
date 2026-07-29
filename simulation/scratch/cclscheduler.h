@@ -108,8 +108,11 @@ static std::vector<std::vector<uint64_t>> s_mem_used; // used per GPU
 static std::vector<std::vector<uint32_t>> s_expert_used; // experts hosted per GPU
 static std::map<uint32_t, std::map<uint64_t, uint64_t>> s_alloc_mem_by_job;
 static std::map<uint32_t, std::map<uint64_t, uint32_t>> s_alloc_experts_by_job;
+static std::map<uint32_t, std::map<uint64_t, uint64_t>> s_expert_alloc_mem_by_job;
+static std::map<uint32_t, std::map<uint64_t, uint32_t>> s_expert_alloc_count_by_job;
 static std::map<uint32_t, PlacementKind> s_placement_kind_by_owner;
-static const uint32_t kMaxExpertsPerGpu = 9;
+static uint32_t kMaxExpertsPerGpu = 9;
+static bool s_print_expert_placement_detail = true;
 // jobId -> expert_id -> list of (node,gpu). We store a vector per expert
 // because an expert may be assigned to multiple GPUs (or a GPU may host
 // multiple experts when expert_num > need).
@@ -131,6 +134,7 @@ struct ExpertPlacementRequest {
   uint64_t expert_mem_bytes;
   uint32_t expert_per_gpu;
   std::vector<std::pair<uint32_t,uint32_t>> gpus;
+  uint32_t trace_layer_id = 0;
 };
 
 // ===== SCHEDULING POLICY INTERFACE: PD placement / need placement =====
@@ -152,8 +156,17 @@ using ExpertPlacementPolicy =
 // Forward declarations for functions used before their full definitions.
 inline void ScheduleTask();
 inline PendingTask SchedulePendingTasks();
-inline std::vector<std::vector<std::pair<uint32_t,uint32_t>>> AssignExperts(uint32_t jobId, uint32_t expert_num, uint64_t expert_mem_bytes, uint32_t expert_per_gpu, const std::vector<std::pair<uint32_t,uint32_t>>& gpus);
+inline std::vector<std::vector<std::pair<uint32_t,uint32_t>>> AssignExperts(uint32_t jobId,
+                                                                            uint32_t expert_num,
+                                                                            uint64_t expert_mem_bytes,
+                                                                            uint32_t expert_per_gpu,
+                                                                            const std::vector<std::pair<uint32_t,uint32_t>>& gpus,
+                                                                            uint32_t trace_layer_id = 0);
 inline void ReleaseExpertAlloc(uint32_t jobId);
+inline bool ReservePlacementMemory(uint32_t ownerId,
+                                   const std::vector<std::pair<uint32_t,uint32_t>>& gpus,
+                                   uint64_t mem_per_gpu);
+inline void SetMaxExpertsPerGpu(uint32_t maxExpertsPerGpu);
 // Return flattened list of all <node,gpu> assigned to the job (across all experts)
 inline std::vector<std::pair<uint32_t,uint32_t>> GetExpertAlloc(uint32_t jobId);
 inline std::vector<std::pair<uint32_t,uint32_t>> GetExpertReplicas(uint32_t jobId, uint32_t expertId);
@@ -325,6 +338,8 @@ inline void Init(uint32_t num_nodes, uint32_t gpus_per_server, uint64_t default_
   s_expert_used.assign(num_nodes, std::vector<uint32_t>(gpus_per_server, 0));
   s_alloc_mem_by_job.clear();
   s_alloc_experts_by_job.clear();
+  s_expert_alloc_mem_by_job.clear();
+  s_expert_alloc_count_by_job.clear();
   s_placement_kind_by_owner.clear();
   s_expert_alloc.clear();
 }
@@ -354,7 +369,8 @@ inline std::vector<std::vector<std::pair<uint32_t,uint32_t>>> AssignExperts(uint
                                                                             uint32_t expert_num,
                                                                             uint64_t expert_mem_bytes,
                                                                             uint32_t expert_per_gpu,
-                                                                            const std::vector<std::pair<uint32_t,uint32_t>>& gpus) {
+                                                                            const std::vector<std::pair<uint32_t,uint32_t>>& gpus,
+                                                                            uint32_t trace_layer_id) {
   std::vector<std::vector<std::pair<uint32_t,uint32_t>>> res;
   if (gpus.empty() || expert_num == 0)
     return res;
@@ -368,7 +384,14 @@ inline std::vector<std::vector<std::pair<uint32_t,uint32_t>>> AssignExperts(uint
     policy = s_expert_placement_policy ? s_expert_placement_policy : RoundRobinExpertPlacementPolicy;
   }
 
-  res = policy(ExpertPlacementRequest{jobId, kind, expert_num, expert_mem_bytes, expert_per_gpu, gpus});
+  res = policy(ExpertPlacementRequest{
+      jobId,
+      kind,
+      expert_num,
+      expert_mem_bytes,
+      expert_per_gpu,
+      gpus,
+      trace_layer_id});
   if (res.size() != expert_num)
     return {};
   for (const auto& replicas : res) {
@@ -376,6 +399,7 @@ inline std::vector<std::vector<std::pair<uint32_t,uint32_t>>> AssignExperts(uint
       return {};
   }
 
+  bool hot_update = false;
   {
     std::lock_guard<std::mutex> lk(s_mutex);
     std::map<uint64_t, uint64_t> mem_delta;
@@ -393,20 +417,99 @@ inline std::vector<std::vector<std::pair<uint32_t,uint32_t>>> AssignExperts(uint
         mem_delta[key] += expert_mem_bytes;
       }
     }
+    std::map<uint64_t, uint64_t> old_mem_delta;
+    std::map<uint64_t, uint32_t> old_expert_delta;
+    auto old_mem_it = s_expert_alloc_mem_by_job.find(jobId);
+    if (old_mem_it != s_expert_alloc_mem_by_job.end()) {
+      old_mem_delta = old_mem_it->second;
+      hot_update = true;
+    }
+    auto old_exp_it = s_expert_alloc_count_by_job.find(jobId);
+    if (old_exp_it != s_expert_alloc_count_by_job.end()) {
+      old_expert_delta = old_exp_it->second;
+      hot_update = true;
+    }
     for (const auto& kv : expert_delta) {
       uint32_t node = static_cast<uint32_t>(kv.first >> 32);
       uint32_t gpu = static_cast<uint32_t>(kv.first & 0xffffffffULL);
       if (kv.second > kMaxExpertsPerGpu)
         return {};
-      if (mem_delta[kv.first] > s_gpu_mem[node][gpu])
+      uint32_t current_experts =
+          s_expert_used[node][gpu] > old_expert_delta[kv.first]
+              ? s_expert_used[node][gpu] - old_expert_delta[kv.first]
+              : 0;
+      uint64_t current_mem =
+          s_mem_used[node][gpu] > old_mem_delta[kv.first]
+              ? s_mem_used[node][gpu] - old_mem_delta[kv.first]
+              : 0;
+      if (current_experts + kv.second > kMaxExpertsPerGpu)
+        return {};
+      if (current_mem + mem_delta[kv.first] > s_gpu_mem[node][gpu])
         return {};
     }
+    for (const auto& kv : old_mem_delta) {
+      uint32_t node = static_cast<uint32_t>(kv.first >> 32);
+      uint32_t gpu = static_cast<uint32_t>(kv.first & 0xffffffffULL);
+      if (node >= s_num_nodes || gpu >= s_gpus_per_server)
+        continue;
+      s_mem_used[node][gpu] =
+          s_mem_used[node][gpu] > kv.second ? s_mem_used[node][gpu] - kv.second : 0;
+      s_busy[node][gpu] = s_mem_used[node][gpu] > 0;
+      auto owner_mem_it = s_alloc_mem_by_job.find(jobId);
+      if (owner_mem_it != s_alloc_mem_by_job.end()) {
+        auto gpu_mem_it = owner_mem_it->second.find(kv.first);
+        if (gpu_mem_it != owner_mem_it->second.end()) {
+          gpu_mem_it->second =
+              gpu_mem_it->second > kv.second ? gpu_mem_it->second - kv.second : 0;
+          if (gpu_mem_it->second == 0)
+            owner_mem_it->second.erase(gpu_mem_it);
+        }
+        if (owner_mem_it->second.empty())
+          s_alloc_mem_by_job.erase(owner_mem_it);
+      }
+    }
+    for (const auto& kv : old_expert_delta) {
+      uint32_t node = static_cast<uint32_t>(kv.first >> 32);
+      uint32_t gpu = static_cast<uint32_t>(kv.first & 0xffffffffULL);
+      if (node >= s_num_nodes || gpu >= s_gpus_per_server)
+        continue;
+      s_expert_used[node][gpu] =
+          s_expert_used[node][gpu] > kv.second ? s_expert_used[node][gpu] - kv.second : 0;
+      auto owner_exp_it = s_alloc_experts_by_job.find(jobId);
+      if (owner_exp_it != s_alloc_experts_by_job.end()) {
+        auto gpu_exp_it = owner_exp_it->second.find(kv.first);
+        if (gpu_exp_it != owner_exp_it->second.end()) {
+          gpu_exp_it->second =
+              gpu_exp_it->second > kv.second ? gpu_exp_it->second - kv.second : 0;
+          if (gpu_exp_it->second == 0)
+            owner_exp_it->second.erase(gpu_exp_it);
+        }
+        if (owner_exp_it->second.empty())
+          s_alloc_experts_by_job.erase(owner_exp_it);
+      }
+    }
+    for (const auto& kv : mem_delta) {
+      uint32_t node = static_cast<uint32_t>(kv.first >> 32);
+      uint32_t gpu = static_cast<uint32_t>(kv.first & 0xffffffffULL);
+      s_mem_used[node][gpu] += kv.second;
+      s_busy[node][gpu] = s_mem_used[node][gpu] > 0;
+      s_alloc_mem_by_job[jobId][kv.first] += kv.second;
+    }
+    for (const auto& kv : expert_delta) {
+      uint32_t node = static_cast<uint32_t>(kv.first >> 32);
+      uint32_t gpu = static_cast<uint32_t>(kv.first & 0xffffffffULL);
+      s_expert_used[node][gpu] += kv.second;
+      s_alloc_experts_by_job[jobId][kv.first] += kv.second;
+    }
     s_expert_alloc[jobId] = res;
+    s_expert_alloc_mem_by_job[jobId] = mem_delta;
+    s_expert_alloc_count_by_job[jobId] = expert_delta;
   }
 
-  {
+  if (s_print_expert_placement_detail) {
     std::ostringstream ss;
     ss << "Scheduler: expert placement placement_owner=" << jobId
+       << " hot_update=" << (hot_update ? 1 : 0)
        << " kind=" << PlacementKindName(kind)
        << " expert_num=" << expert_num
        << " expert_mem_bytes=" << expert_mem_bytes
@@ -424,7 +527,7 @@ inline std::vector<std::vector<std::pair<uint32_t,uint32_t>>> AssignExperts(uint
     ss << "]";
     ccl::CclLog(ss.str());
   }
-  {
+  if (s_print_expert_placement_detail) {
     std::map<uint64_t, std::vector<uint32_t>> experts_by_gpu;
     for (uint32_t e = 0; e < res.size(); ++e) {
       for (const auto& gpu : res[e]) {
@@ -451,9 +554,50 @@ inline std::vector<std::vector<std::pair<uint32_t,uint32_t>>> AssignExperts(uint
   return res;
 }
 
+inline void SetPrintExpertPlacementDetail(bool enabled) {
+  std::lock_guard<std::mutex> lk(s_mutex);
+  s_print_expert_placement_detail = enabled;
+}
+
+inline void SetMaxExpertsPerGpu(uint32_t maxExpertsPerGpu) {
+  std::lock_guard<std::mutex> lk(s_mutex);
+  kMaxExpertsPerGpu = std::max(1u, maxExpertsPerGpu);
+}
+
 inline void ReleaseExpertAlloc(uint32_t jobId) {
   std::lock_guard<std::mutex> lk(s_mutex);
   s_expert_alloc.erase(jobId);
+  s_expert_alloc_mem_by_job.erase(jobId);
+  s_expert_alloc_count_by_job.erase(jobId);
+}
+
+inline bool ReservePlacementMemory(uint32_t ownerId,
+                                   const std::vector<std::pair<uint32_t,uint32_t>>& gpus,
+                                   uint64_t mem_per_gpu) {
+  if (gpus.empty() || mem_per_gpu == 0)
+    return false;
+  std::lock_guard<std::mutex> lk(s_mutex);
+  std::map<uint64_t, uint64_t> mem_delta;
+  for (const auto& gpu : gpus) {
+    if (gpu.first >= s_num_nodes || gpu.second >= s_gpus_per_server)
+      return false;
+    uint64_t key = MakeGpuKey(gpu.first, gpu.second);
+    mem_delta[key] += mem_per_gpu;
+  }
+  for (const auto& kv : mem_delta) {
+    uint32_t node = static_cast<uint32_t>(kv.first >> 32);
+    uint32_t gpu = static_cast<uint32_t>(kv.first & 0xffffffffULL);
+    if (s_mem_used[node][gpu] + kv.second > s_gpu_mem[node][gpu])
+      return false;
+  }
+  for (const auto& kv : mem_delta) {
+    uint32_t node = static_cast<uint32_t>(kv.first >> 32);
+    uint32_t gpu = static_cast<uint32_t>(kv.first & 0xffffffffULL);
+    s_mem_used[node][gpu] += kv.second;
+    s_busy[node][gpu] = s_mem_used[node][gpu] > 0;
+    s_alloc_mem_by_job[ownerId][kv.first] += kv.second;
+  }
+  return true;
 }
 
 inline std::vector<std::pair<uint32_t,uint32_t>> GetExpertAlloc(uint32_t jobId) {
@@ -527,36 +671,45 @@ inline std::vector<std::pair<uint32_t, uint32_t>> FillNeedPlacementPolicy(
 
   std::map<uint64_t, uint64_t> mem_delta;
   std::map<uint64_t, uint32_t> expert_delta;
+  std::set<uint64_t> selected_gpus;
+  uint64_t total_gpus = static_cast<uint64_t>(num_nodes) * gpus_per_server;
   while (res.size() < req.need) {
     bool placed = false;
-    for (uint32_t node = 0; node < num_nodes && !placed; node++) {
-      for (uint32_t g = 0; g < gpus_per_server && !placed; g++) {
-        uint64_t linear = static_cast<uint64_t>(node) * gpus_per_server + g;
-        uint64_t total = static_cast<uint64_t>(num_nodes) * gpus_per_server;
-        uint64_t split = (total * 3) / 4;
-        if (split == 0)
-          split = 1;
-        if (split >= total && total > 1)
-          split = total - 1;
-        if (req.kind == PlacementKind::Prefill && linear >= split)
-          continue;
-        if (req.kind == PlacementKind::Decode && linear < split)
-          continue;
-        uint32_t idx = static_cast<uint32_t>(res.size());
-        uint32_t experts = ExpertsOnGpuIndex(
-            req.expert_num, req.need, idx, req.expert_mem_bytes, req.expert_per_gpu);
-        uint64_t mem_need = static_cast<uint64_t>(experts) * req.expert_mem_bytes;
-        if (node >= mem_used.size() || g >= mem_used[node].size())
-          continue;
-        uint64_t key = MakeGpuKey(node, g);
-        if (expert_used[node][g] + expert_delta[key] + experts > max_experts_per_gpu)
-          continue;
-        if (mem_used[node][g] + mem_delta[key] + mem_need > gpu_mem[node][g])
-          continue;
-        res.emplace_back(node, g);
-        expert_delta[key] += experts;
-        mem_delta[key] += mem_need;
-        placed = true;
+    bool prefer_unique = selected_gpus.size() < total_gpus;
+    for (uint32_t pass = 0; pass < 2 && !placed; ++pass) {
+      bool allow_duplicate = !prefer_unique || pass > 0;
+      for (uint32_t node = 0; node < num_nodes && !placed; node++) {
+        for (uint32_t g = 0; g < gpus_per_server && !placed; g++) {
+          uint64_t linear = static_cast<uint64_t>(node) * gpus_per_server + g;
+          uint64_t total = total_gpus;
+          uint64_t split = (total * 3) / 4;
+          if (split == 0)
+            split = 1;
+          if (split >= total && total > 1)
+            split = total - 1;
+          if (req.kind == PlacementKind::Prefill && linear >= split)
+            continue;
+          if (req.kind == PlacementKind::Decode && linear < split)
+            continue;
+          uint64_t key = MakeGpuKey(node, g);
+          if (!allow_duplicate && selected_gpus.count(key) != 0)
+            continue;
+          uint32_t idx = static_cast<uint32_t>(res.size());
+          uint32_t experts = ExpertsOnGpuIndex(
+              req.expert_num, req.need, idx, req.expert_mem_bytes, req.expert_per_gpu);
+          uint64_t mem_need = static_cast<uint64_t>(experts) * req.expert_mem_bytes;
+          if (node >= mem_used.size() || g >= mem_used[node].size())
+            continue;
+          if (expert_used[node][g] + expert_delta[key] + experts > max_experts_per_gpu)
+            continue;
+          if (mem_used[node][g] + mem_delta[key] + mem_need > gpu_mem[node][g])
+            continue;
+          res.emplace_back(node, g);
+          selected_gpus.insert(key);
+          expert_delta[key] += experts;
+          mem_delta[key] += mem_need;
+          placed = true;
+        }
       }
     }
     if (!placed)
@@ -601,14 +754,10 @@ inline std::vector<std::pair<uint32_t, uint32_t>> TryPlaceNeed(const PlacementRe
     return allocated;
 
   auto policy = s_need_placement_policy ? s_need_placement_policy : FillNeedPlacementPolicy;
-  std::vector<std::vector<uint64_t>> empty_mem_used(
-      s_num_nodes, std::vector<uint64_t>(s_gpus_per_server, 0));
-  std::vector<std::vector<uint32_t>> empty_expert_used(
-      s_num_nodes, std::vector<uint32_t>(s_gpus_per_server, 0));
   allocated = policy(req,
-                     empty_mem_used,
+                     s_mem_used,
                      s_gpu_mem,
-                     empty_expert_used,
+                     s_expert_used,
                      s_num_nodes,
                      s_gpus_per_server,
                      kMaxExpertsPerGpu);
@@ -646,6 +795,9 @@ inline void ReleasePlacement(uint32_t ownerId) {
   auto exp_it = s_alloc_experts_by_job.find(ownerId);
   if (mem_it == s_alloc_mem_by_job.end() && exp_it == s_alloc_experts_by_job.end()) {
     s_placement_kind_by_owner.erase(ownerId);
+    s_expert_alloc.erase(ownerId);
+    s_expert_alloc_mem_by_job.erase(ownerId);
+    s_expert_alloc_count_by_job.erase(ownerId);
     return;
   }
 
@@ -672,6 +824,9 @@ inline void ReleasePlacement(uint32_t ownerId) {
     s_alloc_experts_by_job.erase(exp_it);
   }
   s_placement_kind_by_owner.erase(ownerId);
+  s_expert_alloc.erase(ownerId);
+  s_expert_alloc_mem_by_job.erase(ownerId);
+  s_expert_alloc_count_by_job.erase(ownerId);
 
   {
     std::ostringstream ss;

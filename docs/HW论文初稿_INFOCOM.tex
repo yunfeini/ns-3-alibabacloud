@@ -1,0 +1,311 @@
+\documentclass[10pt,conference]{IEEEtran}
+
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{url}
+
+\title{Topology-Aware Expert Scheduling and Preemptive Local Queueing for MoE Dispatch}
+
+\author{
+\IEEEauthorblockN{Anonymous Authors}
+\IEEEauthorblockA{Paper draft prepared for INFOCOM-style submission}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Mixture-of-Experts (MoE) inference introduces a dispatch phase in which activations are sent from source GPUs to the selected expert replicas. The end-to-end dispatch latency is jointly determined by expert replica placement, replica route selection, and per-GPU local flow scheduling. Existing approaches often tune these components independently, which is insufficient under skewed expert popularity, multi-domain network topology, and bursty dispatch traffic.
+
+This paper proposes a three-stage scheduling framework for MoE dispatch. First, we design a posterior-aware domain-spread expert placement algorithm that uses online expert access statistics to distribute hot expert replicas across L1 switching domains while limiting external-domain accesses. Second, we design an asynchronous live-probe replica routing algorithm that selects among same-rank expert replicas using high- and low-priority one-byte probe feedback. Third, we design a preemptive Lyapunov-drift SRPT local queue scheduler that chunks dispatch flows and schedules local GPU queues by remaining service time and delay debt. We also implement a trace-driven ns-3 simulation framework that supports hot expert placement updates, route-cache rebuilds, asynchronous probing, local flow queues, trace-completion-driven dispatch generation, flow-level completion records, and expert heatmap visualization.
+
+In a 256-GPU, 256-expert, Top-8 dispatch workload driven by expert access traces, the complete algorithm reduces average TPOT from 2071.137 us to 622.408 us compared with the trace baseline, a 69.95\% reduction. Ablation shows that removing expert placement, expert routing, and PLD-SRPT local scheduling increases TPOT by 24.57\%, 14.83\%, and 54.69\%, respectively.
+\end{abstract}
+
+\begin{IEEEkeywords}
+MoE inference, expert placement, data center networks, flow scheduling, ns-3 simulation, dispatch communication.
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Mixture-of-Experts (MoE) models increase model capacity through conditional computation. During inference, each token or batch activates a subset of experts, and the system must dispatch activations from source GPUs to the selected expert replicas. This dispatch communication can dominate the end-to-end latency when expert accesses are skewed and the expert replicas are not aligned with the network topology.
+
+The dispatch phase contains three coupled scheduling decisions. First, expert replicas must be placed on GPUs. Every expert needs coverage, but hot experts require more replicas and those replicas should be distributed across switching domains. Second, when multiple replicas of the same expert exist, each source GPU must select a destination replica. Static shortest-path routing or random replica selection cannot capture runtime congestion. Third, each source GPU maintains a local flow queue. Even with good placement and routing, poor local queue ordering can delay task completion because a dispatch task finishes only after its slowest required flow completes.
+
+This paper argues that these three decisions should be treated as an integrated scheduling pipeline. We make the following contributions:
+
+\begin{itemize}
+  \item We propose a posterior-aware domain-spread expert placement algorithm that uses online expert access statistics and topology-domain load objectives to place expert replicas.
+  \item We propose an asynchronous live-probe replica routing algorithm that uses high- and low-priority probe RTT deltas to select among same-rank expert replicas.
+  \item We propose a preemptive Lyapunov-drift SRPT (PLD-SRPT) local queue scheduler that chunks dispatch flows and prioritizes groups by remaining service time and delay debt.
+  \item We implement a trace-driven dispatch-only ns-3 simulation framework with policy hooks, hot placement updates, route probes, flow completion logging, time-series monitoring, and expert heatmap visualization.
+\end{itemize}
+
+\section{System Model and Problem Statement}
+
+Let the expert set be
+\begin{equation}
+E = \{0,1,\ldots,M-1\},
+\end{equation}
+and let the dispatch GPU set be
+\begin{equation}
+G = \{g_1,g_2,\ldots,g_N\}.
+\end{equation}
+Each GPU $g$ belongs to an L1 switching domain $d(g) \in D$. In the evaluated configuration, $M=256$, $N=256$, each GPU can host 9 expert replicas, and each source GPU dispatches to up to $K=8$ experts.
+
+The size of one expert flow is
+\begin{equation}
+B_{\mathrm{msg}} =
+P_{\mathrm{ffn}} \cdot B_{\mathrm{precision}} \cdot B_{\mathrm{batch}} \cdot N_{\mathrm{dispatch}},
+\end{equation}
+where the current DeepSeek-V3-1B approximation uses $P_{\mathrm{ffn}}=112000$, $B_{\mathrm{precision}}=1$, $B_{\mathrm{batch}}=16$, and $N_{\mathrm{dispatch}}=1$.
+
+The trace provides a target access count $A_e$ for every expert $e$. With trace downsampling factor $z$, the simulator uses
+\begin{equation}
+A'_e =
+\begin{cases}
+0, & A_e = 0,\\
+\lceil A_e/z \rceil, & A_e > 0.
+\end{cases}
+\end{equation}
+The workload keeps submitting dispatch tasks until every expert satisfies
+\begin{equation}
+\mathrm{observed}(e) \ge A'_e.
+\end{equation}
+The primary objective is to minimize average dispatch TPOT. Since $N_{\mathrm{dispatch}}=1$ in the current experiments, TPOT equals dispatch task completion latency.
+
+\section{Algorithm Design}
+
+\subsection{Posterior-Aware Domain-Spread Expert Placement}
+
+Let $x_{e,g}$ denote whether expert $e$ is placed on GPU $g$:
+\begin{equation}
+x_{e,g} =
+\begin{cases}
+1, & \text{expert } e \text{ is placed on GPU } g,\\
+0, & \text{otherwise.}
+\end{cases}
+\end{equation}
+The placement must satisfy
+\begin{align}
+\sum_{g \in G} x_{e,g} &\ge 1, && \forall e \in E,\\
+\sum_{e \in E} x_{e,g} &\le C_g, && \forall g \in G.
+\end{align}
+
+The algorithm uses online posterior expert frequency
+\begin{equation}
+f_e(t) = \alpha + \mathrm{observed}_e(t),
+\end{equation}
+where $\alpha$ is a prior. The placement objective combines external access exposure, replica imbalance, L1-domain variance, L1-domain max load, GPU slot variance, and probe path cost:
+\begin{equation}
+\begin{split}
+J_{\mathrm{place}}(x) ={}&
+w_{\mathrm{ext}} C_{\mathrm{ext}}(x)
++ w_{\mathrm{rep}} C_{\mathrm{rep}}(x)
++ w_{\mathrm{var}} C_{\mathrm{L1var}}(x)\\
+&+ w_{\mathrm{max}} C_{\mathrm{L1max}}(x)
++ w_{\mathrm{gpu}} C_{\mathrm{gpu}}(x)
++ w_{\mathrm{probe}} C_{\mathrm{probe}}(x).
+\end{split}
+\end{equation}
+
+The implemented heuristic has two phases. In the coverage phase, experts are sorted by decreasing posterior frequency and each expert receives at least one replica. The selected GPU minimizes a lexicographic key consisting of same-expert replicas in the target L1 domain, post-placement L1 load, GPU slot load, node id, and GPU id. In the surplus phase, remaining slots are filled by selecting experts that minimize same-domain concentration and replica count normalized by $\sqrt{f_e}$.
+
+\begin{figure}[t]
+\small
+\begin{tabular}{p{0.96\linewidth}}
+\toprule
+\textbf{Algorithm 1: Posterior Domain-Spread Placement}\\
+\midrule
+\textbf{Input:} experts $E$, GPUs $G$, posterior frequencies $f_e$, capacities $C_g$\\
+Sort experts by decreasing $f_e$; sort GPUs by domain and id.\\
+\textbf{Coverage phase:} for each expert $e$, choose a GPU $g$ minimizing same-domain replica count, L1 load after placement, and GPU load; place $e$ on $g$.\\
+\textbf{Surplus phase:} for each GPU $g$, while slots remain, choose an expert $e$ minimizing same-domain concentration and $\mathrm{replica\_count}(e)/\sqrt{f_e}$; place $e$ on $g$.\\
+\textbf{Output:} replica set $R_e$ for every expert $e$.\\
+\bottomrule
+\end{tabular}
+\end{figure}
+
+\subsection{Async Live-Probe Replica Routing}
+
+Given replica set $R_e$, the route cache maps a source GPU and destination expert to a replica:
+\begin{equation}
+r(s,e) \in R_e.
+\end{equation}
+The router first applies a local-first rule: if the source GPU hosts expert $e$, it routes locally; otherwise it prefers a same-host replica. If neither exists, it selects a remote replica using live probe scores.
+
+For source $s$ and candidate replica $g$, the score is
+\begin{equation}
+\begin{split}
+S(s,g) ={}&
+\frac{|T_{\mathrm{low}}(s,g)-T_{\mathrm{high}}(s,g)|}{T_{\mathrm{base}}(s,g)}
++0.25 \frac{\min(T_{\mathrm{low}},T_{\mathrm{high}})}{T_{\mathrm{base}}(s,g)}\\
+&+ w_q \frac{Q(g)}{Q_{\mathrm{norm}}},
+\end{split}
+\end{equation}
+where $T_{\mathrm{high}}$ and $T_{\mathrm{low}}$ are high- and low-priority one-byte probe completion times. In the current configuration $w_q=0$, while the queue-pressure term remains available for future coupling.
+
+\begin{figure}[t]
+\small
+\begin{tabular}{p{0.96\linewidth}}
+\toprule
+\textbf{Algorithm 2: Async Live-Probe Routing}\\
+\midrule
+For each placement update, rebuild the route cache.\\
+For every source GPU $s$ and expert $e$: route locally if $s \in R_e$; otherwise use a same-host replica if available; otherwise choose $\arg\min_{g\in R_e} S(s,g)$.\\
+In the background, periodically select stale source-destination pairs, submit high- and low-priority one-byte probes, and update the live probe table after completion.\\
+\bottomrule
+\end{tabular}
+\end{figure}
+
+\subsection{PLD-SRPT Local Flow Scheduling}
+
+Each source GPU maintains a local flow queue. To approximate preemption, large dispatch flows are split into chunks of 262144 bytes. Chunks from the same original flow share a flow group id. For group $j$, let
+\begin{equation}
+S_j(t) = \mathrm{standalone\_fct}(\mathrm{remaining\_bytes}_j)
+\end{equation}
+be the estimated remaining service time. Let
+\begin{equation}
+A_j(t) = t - a_j
+\end{equation}
+be the waiting age, where $a_j$ is the group arrival time. Define delay debt
+\begin{equation}
+D_j(t)=\max(0,A_j(t)-D_0-\kappa S_j(t)).
+\end{equation}
+The scheduler selects the group maximizing
+\begin{equation}
+\mathrm{Score}_j(t)=
+\frac{V+\beta D_j(t)+0.5D_j(t)^2/T_0}
+{S_j(t)+O_{\mathrm{preempt}}}.
+\end{equation}
+When all debts are zero, the policy reduces to SRPT. When a long flow waits too long, the debt term increases its priority.
+
+\begin{figure}[t]
+\small
+\begin{tabular}{p{0.96\linewidth}}
+\toprule
+\textbf{Algorithm 3: PLD-SRPT Local Queue Scheduling}\\
+\midrule
+Group queued chunks by original flow id.\\
+For each group, estimate remaining service time $S_j(t)$ and delay debt $D_j(t)$.\\
+Compute $\mathrm{Score}_j(t)$.\\
+Select the group with the largest score; break ties by smaller remaining service time, earlier arrival, and smaller sequence number.\\
+Dispatch the first waiting chunk from the selected group.\\
+\bottomrule
+\end{tabular}
+\end{figure}
+
+\section{Simulation Framework}
+
+We implement a trace-driven dispatch-only simulation framework on top of ns-3. The design goal is to make placement, routing, local scheduling, tracing, and visualization independently configurable and reproducible.
+
+\subsection{Execution Pipeline}
+
+The simulator follows this loop:
+\begin{enumerate}
+  \item load topology, network configuration, and policy configuration;
+  \item load trace expert placement and expert access targets;
+  \item submit dispatch tasks until trace targets are satisfied;
+  \item before each new task, update posterior expert access statistics;
+  \item run expert placement and rebuild the route cache;
+  \item submit dispatch flows into source-GPU local queues;
+  \item execute ns-3 network flows and record completions;
+  \item write logs, CSV summaries, and heatmaps.
+\end{enumerate}
+
+\subsection{Implementation Components}
+
+\begin{table}[t]
+\centering
+\caption{Simulation framework components.}
+\label{tab:framework}
+\small
+\begin{tabular}{p{0.32\linewidth}p{0.58\linewidth}}
+\toprule
+\textbf{File} & \textbf{Responsibility}\\
+\midrule
+\texttt{pipeline\_policy\_config.h} & Policy parsing, strategy hooks, PLD-SRPT selector, trace parameters.\\
+\texttt{cclscheduler.h} & GPU sets, expert placement structures, need placement, access-frequency state.\\
+\texttt{mnCCL.h} & Dispatch tasks, route cache, async probes, local queues, completion records.\\
+\texttt{task\_generator.h} & Fixed workload and dispatch-N distribution generation.\\
+\texttt{NormalNetwork.cc} & Topology loading, policy loading, ns-3 simulation entry point.\\
+\texttt{plot\_expert\_heatmap.py} & Placement and access heatmap visualization.\\
+\texttt{run\_dispatch\_three\_algo\_ablation\_visual.py} & Baselines, full algorithm, and three ablations.\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The framework outputs \texttt{mncc.log}, \texttt{mncc\_flow\_finish.csv}, \texttt{mncc\_cluster\_timeseries.csv}, \texttt{summary.csv}, TPOT plots, queue-pressure plots, and expert placement/access heatmaps.
+
+\section{Evaluation}
+
+\subsection{Setup}
+
+We evaluate a 256-GPU, 256-expert configuration with 9 expert slots per GPU and Top-8 dispatch. The trace uses layer 0 from the HW data directory. The 32-device baseline expert placement is tiled to 256 GPUs. We use a 20x trace downsampling factor.
+
+The evaluated methods are:
+\begin{itemize}
+  \item \textbf{baseline\_uniform}: trace placement, default routing, uniform expert targets;
+  \item \textbf{baseline\_trace}: trace placement, default routing, original trace targets;
+  \item \textbf{all\_three}: expert placement, async probe routing, and PLD-SRPT;
+  \item \textbf{no\_expert\_placement}: ablates Algorithm 1;
+  \item \textbf{no\_expert\_routing}: ablates Algorithm 2;
+  \item \textbf{no\_local\_pld\_srpt}: ablates Algorithm 3.
+\end{itemize}
+
+\subsection{Main Results}
+
+\begin{table}[t]
+\centering
+\caption{20x trace-driven dispatch results.}
+\label{tab:results}
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Method} & \textbf{TPOT (us)} & \textbf{Delta} & \textbf{Probe bytes}\\
+\midrule
+baseline\_uniform & 1705.909 & +174.08\% & 0\\
+baseline\_trace & 2071.137 & +232.76\% & 0\\
+all\_three & 622.408 & ref & 0.000249\%\\
+no\_expert\_placement & 775.329 & +24.57\% & 0.000287\%\\
+no\_expert\_routing & 714.696 & +14.83\% & 0\\
+no\_local\_pld\_srpt & 962.798 & +54.69\% & 0.000383\%\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All methods complete the trace targets. Compared with \textbf{baseline\_trace}, \textbf{all\_three} reduces average TPOT from 2071.137 us to 622.408 us, a 69.95\% reduction. Compared with \textbf{baseline\_uniform}, it reduces TPOT by 63.51\%.
+
+The ablation results show that all three algorithms contribute. Removing PLD-SRPT causes the largest degradation, increasing TPOT by 54.69\%. Removing expert placement increases TPOT by 24.57\%, and removing expert routing increases TPOT by 14.83\%.
+
+The data-byte statistics also support the placement algorithm. \textbf{all\_three} submits 230.65 GB of data flows, while \textbf{no\_expert\_placement} submits 248.64 GB, 7.80\% more. This indicates that optimized expert placement reduces network traffic volume, not only route cost.
+
+\section{Discussion}
+
+PLD-SRPT has the largest effect because dispatch completion is gated by the slowest required flow. Chunking lets shorter remaining flow groups complete earlier and reduces average task completion time. However, queue-length metrics must be interpreted carefully: with PLD-SRPT, local queues count chunks rather than original flows, so TPOT is the primary comparable metric.
+
+The route-probe algorithm shows positive contribution at 20x, but prior 100x experiments showed weaker or negative interaction with PLD-SRPT. This suggests that route-score hyperparameters are topology- and workload-dependent. A natural extension is online calibration of placement and routing parameters using SPSA and counterfactual estimates based on posterior access, probe samples, and queue pressure.
+
+\section{Limitations and Future Work}
+
+First, the placement algorithm is heuristic rather than a globally optimal integer program. Second, route-score weights are manually configured and may not generalize across topologies. Third, PLD-SRPT currently uses a fixed chunk size; future work should tune it using link BDP and observed flow-size distribution. Fourth, the current simulator isolates dispatch-only behavior; integrating attention, compute, KV cache, and multi-layer pipeline behavior is future work.
+
+\section{Conclusion}
+
+This paper presents a topology-aware MoE dispatch scheduling system with three components: posterior-aware domain-spread expert placement, asynchronous live-probe replica routing, and PLD-SRPT local queue scheduling. We also implement a trace-driven ns-3 simulation framework that supports policy hooks, hot updates, route probes, local queues, flow-level logging, and heatmap visualization. Evaluation on a 256-GPU trace-driven workload shows that the complete algorithm reduces average TPOT by 69.95\% relative to the trace baseline, and that each of the three components provides measurable benefit.
+
+\begin{thebibliography}{1}
+
+\bibitem{moe}
+N. Shazeer et al., ``Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer,'' in \emph{ICLR}, 2017.
+
+\bibitem{ns3}
+G. F. Riley and T. R. Henderson, ``The ns-3 Network Simulator,'' in \emph{Modeling and Tools for Network Simulation}, Springer, 2010.
+
+\bibitem{srpt}
+L. Schrage, ``A Proof of the Optimality of the Shortest Remaining Processing Time Discipline,'' \emph{Operations Research}, 1968.
+
+\end{thebibliography}
+
+\end{document}

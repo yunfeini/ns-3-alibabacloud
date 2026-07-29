@@ -126,7 +126,7 @@ int main(int argc, char* argv[]) {
   {
     std::ofstream ofs(mncc_flow_finish_log, std::ofstream::trunc);
     ofs << "finish_time_ns,jobId,srcNode,dstNode,pg,sport,dport,msg_size,"
-        << "qp_start_time_step,actual_fct,standalone_fct\n";
+        << "qp_start_time_step,actual_fct_ns,standalone_fct_ns\n";
   }
 
   taskGenerator::RegisterPipelineWorkload(taskGenerator::DefaultPipelineWorkloadParams());

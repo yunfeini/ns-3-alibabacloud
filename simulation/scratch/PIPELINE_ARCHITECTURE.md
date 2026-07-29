@@ -39,6 +39,57 @@ P 集群和 D 集群不是互斥资源。只要满足显存和每 GPU 最大专�
 
 默认专家放置策略是 `RoundRobinExpertPlacementPolicy(...)`。
 
+## 当前调优版专家放置算法
+
+策略名：`domain_balanced_external_min`
+
+该策略用于在已选定的 P/D GPU 集合内决定每个 expert replica 的具体 GPU。策略目标是同时降低跨 L1 交换域访问、避免单个 L1 交换域承载过高专家访问频次，并保持同一专家的 replica 在交换域间不过度偏斜。
+
+设：
+
+- 专家集合为 `E`，隐藏真实访问分布由 `EXPERT_ACCESS_FREQ` 驱动 alltoall 目的专家采样，但该分布不直接暴露给专家放置策略。
+- 专家放置使用后验估计 `f_hat_e = expert_access_prior + observed_access_count(e)`。仿真开始时所有专家只有均匀先验；每次 alltoall 实际采样到目的 expert 后，`mnccl::RecordExpertAccess(...)` 更新观测计数。
+- 当前选中 GPU 所属 L1 domain 集合为 `D`。
+- `x_{e,g} in {0,1}` 表示专家 `e` 是否放置在 GPU `g`。
+- `domain(g)` 表示 GPU `g` 所属 L1 domain。
+- `L_d = sum_e sum_{g:domain(g)=d} f_hat_e x_{e,g}` 表示 L1 domain `d` 的后验频次加权专家负载。
+- `C_e = {domain(g) | x_{e,g}=1}` 表示专家 `e` 覆盖到的 L1 domain 集合。
+
+算法使用增量评分器维护候选放置后的指标：
+
+- `externalAccessCost = sum_e f_hat_e * (|D| - |C_e|)`，惩罚后验高频专家没有覆盖到足够多 L1 domain。
+- `replicaDomainImbalance = sum_e f_hat_e * Var({replica_count(e,d) | d in D})`，惩罚同一专家 replica 在不同 L1 domain 上过度不均衡。
+- `l1Variance = Var({L_d | d in D})`，惩罚交换域间总访问频次不均衡。
+- `maxL1Load = max_d L_d`，控制最热点 L1 交换域。
+- `gpuLoadVariance = Var({expert_count(g)})`，控制 GPU 专家槽位分布。
+
+最终归一化目标函数为：
+
+```text
+score =
+  w_ext * externalNorm
+  + w_replica * replicaNorm
+  + w_l1_var * l1VarNorm
+  + w_l1_max * l1MaxNorm
+  + w_gpu_var * gpuVarNorm
+```
+
+本轮调优后的默认权重为：
+
+```text
+PLACEMENT_EXTERNAL_WEIGHT 4.0
+PLACEMENT_REPLICA_BALANCE_WEIGHT 2.0
+PLACEMENT_L1_VARIANCE_WEIGHT 1.0
+PLACEMENT_L1_MAX_WEIGHT 2.0
+PLACEMENT_GPU_VARIANCE_WEIGHT 1.0
+PLACEMENT_FORCE_NEW_L1_DOMAIN 1
+PLACEMENT_PROBE_WEIGHT 0
+```
+
+`PLACEMENT_FORCE_NEW_L1_DOMAIN=1` 表示在填充额外 replica 时，优先选择能让该 expert 覆盖新 L1 domain 的候选；quick-search 结果显示，完全取消这一覆盖约束会让早期 replica 覆盖不足，导致 TTFT/TPOT 劣化。因此当前版本保留覆盖约束，并通过降低 `replica` 权重、提高 `l1_max` 权重来更偏向热点交换域削峰。
+
+最新 probe-aware placement 消融显示，将 route probe cost 直接纳入专家放置会轻微破坏副本域均衡，TTFT 不如当前最佳版本。因此当前版本保留 `probe_path_cost` 监控/研究接口，但默认 `PLACEMENT_PROBE_WEIGHT=0`，probe 只用于同 rank 副本路由。
+
 ## 调度策略接口
 
 所有后续要替换策略的位置都用醒目标记：
@@ -98,6 +149,21 @@ P 集群和 D 集群不是互斥资源。只要满足显存和每 GPU 最大专�
 - `cclScheduler::GetExpertReplicas(...)`
 
 默认策略为 round-robin。`need > expert_num` 时会自然产生同 rank 多 replica。
+
+调优版策略参数均可在 policy config 中配置，也可由 `run_domain_placement_full_load_compare.py` 通过命令行覆盖：
+
+- `--placement-external-weight`
+- `--placement-replica-balance-weight`
+- `--placement-l1-variance-weight`
+- `--placement-l1-max-weight`
+- `--placement-gpu-variance-weight`
+- `--placement-probe-weight`
+- `--placement-force-new-l1-domain`
+- `--pd-ratio` 与 `--pd-total`，例如 `--pd-ratio 3:1 --pd-total 160` 会生成 `NEED_PREFILL=120, NEED_DECODE=40`
+- `--expert-num`
+- `--expert-per-gpu`
+
+实验脚本中的 `baseline` 现在表示所有策略接口均使用 `default`，包括 need placement、expert placement、same-rank route、local flow schedule、global need update 和 PD split；`incremental` 表示当前保留的最佳版本：启用 `domain_balanced_external_min` 专家放置、`probe_rtt_delta` 路由、`decode_first_prefill_later` 本地队列策略，并显式使用 `PD_SPLIT_POLICY default`。
 
 ### PD 分割点
 
@@ -183,7 +249,7 @@ P 集群和 D 集群不是互斥资源。只要满足显存和每 GPU 最大专�
 
 `mnccl::SubmitAllToAll(...)`
 
-根据专家放置映射生成 alltoall 流。目的 expert rank 由概率表采样，具体 replica 由路由策略选择。
+根据专家放置映射生成 alltoall 流。目的 expert rank 由隐藏概率表采样，具体 replica 由路由策略选择；采样到的目的 expert 会写入后验访问统计，供下一次 task 下发时的放置策略使用。
 
 `mnccl::SubmitFlow(...)`
 

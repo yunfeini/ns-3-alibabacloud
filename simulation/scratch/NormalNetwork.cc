@@ -131,7 +131,7 @@ int main(int argc, char* argv[]) {
   {
     std::ofstream ofs(mncc_flow_finish_log, std::ofstream::trunc);
     ofs << "finish_time_ns,jobId,srcNode,dstNode,pg,sport,dport,msg_size,"
-        << "qp_start_time_step,actual_fct,standalone_fct\n";
+        << "qp_start_time_step,actual_fct_ns,standalone_fct_ns\n";
   }
   {
     std::ofstream ofs(mncc_cluster_timeseries_log, std::ofstream::trunc);
@@ -140,13 +140,17 @@ int main(int argc, char* argv[]) {
         << "used_expert_slots,free_expert_slots,max_free_expert_slots,"
         << "gpu_utilization,expert_slot_utilization,expert_fragmentation,"
         << "free_slot_variance,placement_gpu_utilization,used_gpu_mem_bytes,"
-        << "total_gpu_mem_bytes\n";
+        << "total_gpu_mem_bytes,cn_fragmentation,sched_success_rate,"
+        << "fragment_block_rate,complete_8gpu_hosts,same_tor_8gpu_blocks,"
+        << "free_gpus\n";
   }
 
   auto workload_params = taskGenerator::DefaultPipelineWorkloadParams();
   auto policy_cfg = pipelinePolicy::LoadPolicyConfig(policy_config_file);
   workload_params = pipelinePolicy::ApplyPolicyConfig(workload_params, policy_cfg);
-  taskGenerator::RegisterPipelineWorkload(workload_params);
+  if (policy_cfg.enable_inference_workload)
+    taskGenerator::RegisterPipelineWorkload(workload_params);
+  pipelinePolicy::RegisterTrainingAllReduceWorkload(policy_cfg);
   mnccl::StartClusterTimeSeriesMonitor(policy_cfg.cluster_monitor_interval_ns);
 
   Simulator::Stop(Seconds(workload_params.simulation_stop_time));
